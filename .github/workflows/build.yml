@@ -10,16 +10,21 @@ name: Build
 # 2.x branch assumes a BLEAddress ctor that 2.0.17 does not have). Upgrading the
 # core -- not patching the library -- is the fix.
 #
-# Uses arduino/setup-task + arduino-cli directly rather than
-# arduino/compile-sketches: that action only emits a JSON report, and we need the
-# actual .bin to flash the board.
+# Driven through arduino-cli directly instead of arduino/setup-task +
+# arduino/compile-action: that pair no longer works. compile-action has been
+# removed (folded into compile-sketches, which only emits a JSON report and
+# never uploads build output), and setup-task has been reduced to a version
+# resolver that accepts only 'version' and 'repo-token' -- it installs nothing,
+# so arduino-cli ends up missing from PATH.
 on:
   push:
   workflow_dispatch:
 
 env:
+  ARDUINO_CLI_VERSION: '1.5.1'
   PLATFORM: esp32:esp32@3.3.12
-  LIBRARY_VERSION: v7.3.0
+  LIBRARY_REPO: https://github.com/sauloverissimo/ESP32_Host_MIDI.git
+  LIBRARY_TAG: v7.3.0
   # 3.x lives on Espressif's index, not downloads.arduino.cc.
   ESP32_INDEX: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
   # PSRAM=opi is mandatory: N16R8 is octal PSRAM, and the generic
@@ -42,17 +47,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install arduino-esp32 and the library
-        uses: arduino/setup-task@v1
+      - name: Cache Arduino cores and libraries
+        uses: actions/cache@v4
         with:
-          repositories: |
-            - source-url: ${{ env.ESP32_INDEX }}
-          platform: ${{ env.PLATFORM }}
-          libraries: |
-            - source: github
-              repo: sauloverissimo/ESP32_Host_MIDI
-              version: ${{ env.LIBRARY_VERSION }}
-          cache: true
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-${{ runner.os }}-esp32-3.3.12-${{ env.LIBRARY_TAG }}-${{ hashFiles('**/*.ino') }}
+          restore-keys: |
+            arduino-${{ runner.os }}-esp32-3.3.12-${{ env.LIBRARY_TAG }}-
+
+      - name: Install arduino-cli ${{ env.ARDUINO_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${ARDUINO_CLI_VERSION}_Linux_64bit.tar.gz" \
+            | tar -xz -C "$HOME/bin"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install arduino-esp32 3.3.12 and ESP32_Host_MIDI
+        run: |
+          set -euo pipefail
+          arduino-cli core update-index --additional-urls "$ESP32_INDEX"
+          arduino-cli core install "$PLATFORM" --additional-urls "$ESP32_INDEX"
+          arduino-cli lib install ESP32_Host_MIDI --git-url "$LIBRARY_REPO" --tag "$LIBRARY_TAG"
 
       - name: Record resolved environment
         run: |
@@ -60,12 +78,13 @@ jobs:
           echo
           arduino-cli core list
           echo
-          arduino-cli lib list | grep -i -E 'ESP32_Host_MIDI|MIDI'
+          arduino-cli lib list | grep -i midi
 
       - name: Compile ${{ matrix.sketch }}
         run: |
+          set -euo pipefail
           arduino-cli compile \
-            --fqbn "${{ env.FQBN }}" \
+            --fqbn "$FQBN" \
             --warnings all \
             --export-binaries \
             --output-dir out \
