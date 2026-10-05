@@ -58,6 +58,13 @@ jobs:
           # host involved at all. USB Host MIDI will need USBMode=default later.
           - sketch: ProbeD
             fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+          # Dual transport: DIN-5 UART plus BLEClientConnection as BLE central.
+          # BLEClientConnection.cpp is the file that failed to compile on 2.0.17,
+          # so it is the most fragile thing in the library and the most worth
+          # proving on hardware. Registering two transports also checks that
+          # midiHandler.task() dispatches to both.
+          - sketch: ProbeE
+            fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
     steps:
       - uses: actions/checkout@v4
