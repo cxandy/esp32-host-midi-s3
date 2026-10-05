@@ -13,7 +13,7 @@ source dependency. Every fix lives in the environment (the core version).
 
 ## Verified results
 
-Captured from a `ProbeD` run on the board, 264 s uptime:
+UART path, from a `ProbeD` run, 264 s uptime:
 
 ```
 [PROBE-D] ESP32_Host_MIDI DIN-5 probe, OLED + buttons
@@ -24,14 +24,26 @@ Captured from a `ProbeD` run on the board, 264 s uptime:
 [SEND] NoteOn C4 / [SEND] NoteOff C4   (alternating every 2 s)
 ```
 
+BLE path, from a `ProbeE` run, 245 s uptime:
+
+```
+[PROBE-E] BLE central scanning: yes
+[PROBE-E] reset reason=0xb, transports: UART + BLE
+[ALIVE] up=2s   heap=218620 psram=8382776 queue=0 rx=0 ble=scanning
+[ALIVE] up=245s heap=217396 psram=8382776 queue=0 rx=0 ble=scanning
+```
+
 | Claim | Evidence |
 |---|---|
 | Library compiles unmodified on 3.3.12 | CI green on all probes; the four 2.0.17 errors in `BLEClientConnection.cpp` are gone |
-| Runs on hardware without crashing | 264 s uptime, `heap=331364` flat, no watchdog reset |
-| **`PSRAM=opi` really brings up the octal PSRAM** | `psram=8382776` (~8 MB), matching the N16R8 spec |
+| Runs on hardware without crashing | 264 s (UART) and 245 s (UART+BLE) uptime, no watchdog reset |
+| **`PSRAM=opi` really brings up the octal PSRAM** | `psram=8382776` (~8 MB) in every run, matching the N16R8 spec |
+| **`BLEClientConnection` works** — the file that broke on 2.0.17 | BLE central scans for 245 s, `ble=scanning` throughout |
+| Two transports coexist | UART + BLE registered together; `midiHandler.task()` dispatches to both |
+| No heap leak under BLE scanning | sawtooth 217.4k–219.8k with no downward trend; BLE costs ~113 KB vs 331 kB baseline |
 | OLED usable | SH1106 ACKs at 0x3C on SCL=IO11 / SDA=IO21 |
 | MIDI TX path works | `sendNoteOn/Off` → UART 31250 → IO15, self-test note on C4 |
-| MIDI RX path | **not yet exercised** — `rx=0`, nothing connected to DIN-5 |
+| MIDI RX path | **not yet exercised** — `rx=0`, no DIN-5 device or BLE peripheral in range |
 
 ## Board
 
@@ -95,6 +107,7 @@ different board. See "Next steps".
 | `ProbeB` | `UARTConnection` DIN-5 transport on the board's real MIDI pins (RX IO4, TX IO15). |
 | `ProbeC` | No library, no PSRAM, output on USB-Serial-JTAG. Isolates "can any sketch boot" from "is the probe or the PSRAM config wrong". |
 | `ProbeD` | DIN-5 MIDI **plus** the board's SH1106 OLED and buttons. The instrumented one. |
+| `ProbeE` | DIN-5 UART **and** `BLEClientConnection` as BLE central, two transports at once. Proves the most version-fragile file in the library. |
 
 ### ProbeD: OLED and buttons
 
@@ -191,15 +204,29 @@ The upgrade also does not fit locally: 3.3.12 needs ~1.85 GB of downloads
 expanding to ~3 GB, and the C: drive had under 5 GB free behind an existing
 4.9 GB of `Arduino15` packages.
 
+## Transport summary
+
+| Transport | Fits this board? | State |
+|---|---|---|
+| DIN-5 UART | yes | TX verified; RX needs a device |
+| BLE central | yes | scanning verified; connect needs a peripheral |
+| USB Host | **no** | single PHY + USB-C device port |
+| USB-MIDI device | hardware allows | library has no device-side MIDI class |
+
+Two BLE roles exist and they are opposites — easy to mix up:
+
+- `BLEClientConnection` — **central**: this board scans and connects *out* to a
+  BLE MIDI peripheral. Used by `ProbeE`.
+- `BLEConnection` — **peripheral**: this board advertises and others connect
+  *in*. Used by `examples/T-Display-S3-BLE-Receiver`.
+
 ## Next steps
 
-1. **Exercise MIDI RX.** Needs either a MIDI device on DIN-5, or a DIN-5 loopback
-   (board OUT back to IN) so the self-test note on C4 returns as an RX event.
-   TX and RX share one queue path through `MIDIHandler`, so TX passing is
-   encouraging but not proof of the receive direction.
-2. **BLE MIDI** is the remaining library transport that fits this hardware.
-   `BLEClientConnection` makes the S3 a BLE *central*, which the S3 supports;
-   it needs a BLE MIDI peripheral to connect to.
-3. **USB-MIDI device mode**, not host — see the hardware finding above. The
+1. **Exercise MIDI RX.** Needs either a MIDI device on DIN-5, a DIN-5 loopback
+   (board OUT back to IN) so the self-test note on C4 returns as an RX event, or
+   a BLE MIDI peripheral for the `ProbeE` page 2 path. TX and RX share one queue
+   path through `MIDIHandler`, so TX passing is encouraging but not proof of the
+   receive direction.
+2. **USB-MIDI device mode**, not host — see the hardware finding above. The
    library does not implement a USB device MIDI class, so this would be separate
    work rather than a configuration change.
