@@ -72,6 +72,14 @@ jobs:
           # that shape can never be tested against a phone.
           - sketch: ProbeF
             fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+          # Diagnostic: ProbeF's OLED freezes once a BLE central connects. This
+          # one times midiHandler.task() and the OLED transfer separately and
+          # counts loop iterations, so the suspected starvation in
+          # BLEConnection::processQueue() is measured rather than assumed. The
+          # numbers are also on OLED page 1, since the serial terminal was the
+          # thing that looked frozen.
+          - sketch: ProbeG
+            fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
     steps:
       - uses: actions/checkout@v4
