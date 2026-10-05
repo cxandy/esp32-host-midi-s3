@@ -138,8 +138,11 @@ void setup() {
   u8g2.sendBuffer();
   delay(50);
   // A SH1106 answers ACKNOWLEDGE; probing Wire directly keeps the verdict honest
-  // instead of assuming success from a silent begin().
-  oledOk = (Wire.beginTransmission(0x3C) != 0);
+  // instead of assuming success from a silent begin(). Note beginTransmission()
+  // returns void on arduino-esp32 (unlike AVR), so the ACK has to come from
+  // endTransmission(): 0 means a device acknowledged the address.
+  Wire.beginTransmission(0x3C);
+  oledOk = (Wire.endTransmission() == 0);
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tf);
   u8g2.drawStr(0, 12, oledOk ? "OLED ok" : "OLED MISSING");
@@ -246,7 +249,7 @@ static void render() {
   switch (page) {
     case 0: {
       // The single most important thing on the board: proof it booted.
-      u8g2.setFont(u8g2_font_10x12_tf);
+      u8g2.setFont(u8g2_font_t0_12_tf);
       u8g2.drawStr(4, 14, "RUNNING");
       u8g2.setFont(u8g2_font_6x12_tf);
       row(28, "up %lus  page %u/%u", millis() / 1000, page + 1, pageCount);
