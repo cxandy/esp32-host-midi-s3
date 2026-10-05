@@ -29,8 +29,19 @@ env:
   ESP32_INDEX: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
   # PSRAM=opi is mandatory: N16R8 is octal PSRAM, and the generic
   # PSRAM=enabled (quad) leaves the board reset-looping at boot.
+  #
+  # USBMode=default (TinyUSB), not hwcdc:
+  #   - The ESP32-S3 ROM boots into the USB downloader whenever the chip is
+  #     reset while the USB host link is up ("rst:0x15 USB_UART_CHIP_RESET,
+  #     boot:0x0 DOWNLOAD" + "waiting for download"). DTR/RTS polarity is not
+  #     the deciding factor, so with hwcdc -- which has no 1200 bps touch --
+  #     there is no way to get the board running the sketch without a physical
+  #     cable pull. TinyUSB CDC supports the 1200 bps touch, so the host can
+  #     boot the app over the same cable.
+  #   - USB Host MIDI needs TinyUSB host mode on the S3's single internal USB
+  #     PHY anyway (the library uses <usb/usb_host.h>); hwcdc cannot host.
   FQBN: >-
-    esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+    esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=default,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
 jobs:
   build:
