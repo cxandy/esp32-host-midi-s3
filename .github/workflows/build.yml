@@ -1,0 +1,44 @@
+name: Build
+
+# CI-only feasibility build for ESP32_Host_MIDI on the AciduinoV2Box ESP32-S3.
+#
+# Why CI: arduino-esp32 3.3.12 pulls ~1.85 GB of toolchains and expands to
+# ~3 GB, which did not fit on the local C: drive. GitHub runners have room.
+#
+# Platform is pinned to 3.3.12 on purpose: the library declares >= 3.0.0, and
+# on 2.0.17 src/BLEClientConnection.cpp fails to compile (its ESP_ARDUINO_VERSION
+# 2.x branch assumes a BLEAddress ctor that 2.0.17 does not have). Upgrading the
+# core -- not patching the library -- is the fix.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.sketch }} / esp32s3
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sketch:
+          - ProbeA
+          - ProbeB
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/compile-action@v1
+        with:
+          sketch-path: ${{ matrix.sketch }}
+          fqbn: >-
+            esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+          platforms: |
+            - name: esp32:esp32
+              version: 3.3.12
+              source-url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          libraries: |
+            - source: github
+              repo: sauloverissimo/ESP32_Host_MIDI
+              version: v7.3.0
+          enable-cache: true
