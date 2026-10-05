@@ -27,21 +27,6 @@ env:
   LIBRARY_TAG: v7.3.0
   # 3.x lives on Espressif's index, not downloads.arduino.cc.
   ESP32_INDEX: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-  # PSRAM=opi is mandatory: N16R8 is octal PSRAM, and the generic
-  # PSRAM=enabled (quad) leaves the board reset-looping at boot.
-  #
-  # USBMode=default (TinyUSB), not hwcdc:
-  #   - The ESP32-S3 ROM boots into the USB downloader whenever the chip is
-  #     reset while the USB host link is up ("rst:0x15 USB_UART_CHIP_RESET,
-  #     boot:0x0 DOWNLOAD" + "waiting for download"). DTR/RTS polarity is not
-  #     the deciding factor, so with hwcdc -- which has no 1200 bps touch --
-  #     there is no way to get the board running the sketch without a physical
-  #     cable pull. TinyUSB CDC supports the 1200 bps touch, so the host can
-  #     boot the app over the same cable.
-  #   - USB Host MIDI needs TinyUSB host mode on the S3's single internal USB
-  #     PHY anyway (the library uses <usb/usb_host.h>); hwcdc cannot host.
-  FQBN: >-
-    esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=default,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
 jobs:
   build:
@@ -51,9 +36,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sketch:
-          - ProbeA
-          - ProbeB
+        include:
+          # PSRAM=opi: N16R8 is octal PSRAM, and the generic PSRAM=enabled
+          # (quad) leaves the board reset-looping at boot.
+          - sketch: ProbeA
+            fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+          - sketch: ProbeB
+            fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+          # Isolation probe: no library, no PSRAM. USBMode=hwcdc puts Serial on
+          # the USB-Serial-JTAG peripheral -- the same COM port the ROM
+          # downloader uses -- so Windows already has it enumerated and output
+          # is capturable without a TinyUSB re-enumeration, and it is not gated
+          # on DTR the way TinyUSB CDC is. If this cannot run, the blocker is
+          # the USB reset path, not the probe or the PSRAM configuration.
+          - sketch: ProbeC
+            fqbn: esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
     steps:
       - uses: actions/checkout@v4
@@ -64,9 +61,12 @@ jobs:
           path: |
             ~/.arduino15
             ~/Arduino/libraries
-          key: arduino-${{ runner.os }}-esp32-3.3.12-${{ env.LIBRARY_TAG }}-${{ hashFiles('**/*.ino') }}
+          # Keyed on the core version only: that is what dominates the ~3 GB,
+          # and including a sketch hash would re-download everything on every
+          # probe edit. The library is re-cloned from the pinned tag each run.
+          key: arduino-${{ runner.os }}-esp32-3.3.12-${{ env.LIBRARY_TAG }}
           restore-keys: |
-            arduino-${{ runner.os }}-esp32-3.3.12-${{ env.LIBRARY_TAG }}-
+            arduino-${{ runner.os }}-esp32-3.3.12-
 
       - name: Install arduino-cli ${{ env.ARDUINO_CLI_VERSION }}
         run: |
@@ -102,7 +102,7 @@ jobs:
         run: |
           set -euo pipefail
           arduino-cli compile \
-            --fqbn "$FQBN" \
+            --fqbn "${{ matrix.fqbn }}" \
             --warnings all \
             --export-binaries \
             --build-path build \
