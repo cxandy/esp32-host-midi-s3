@@ -80,6 +80,15 @@ jobs:
           # thing that looked frozen.
           - sketch: ProbeG
             fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+          # Isolate the OLED bus cost. ProbeG measured its own unthrottled probe
+          # rather than ProbeF, so ProbeF's profile is still unmeasured. This one
+          # separates clearBuffer (RAM) from sendBuffer (the bus) at the default
+          # speed, explicit 100 kHz and explicit 400 kHz -- the last matching the
+          # board's own firmware (AciduinoV2Box oled.cpp:65 setBusClock(400000),
+          # which no probe has been doing) -- and checks Wire's error status
+          # directly, since U8G2 swallows NACKs.
+          - sketch: ProbeH
+            fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
     steps:
       - uses: actions/checkout@v4
