@@ -73,6 +73,9 @@ jobs:
           # 'lib install --git-url' is refused by default in arduino-cli 1.5
           # unless sketch.always_allow_unsafe_lib_url is turned on. Cloning the
           # pinned tag into the sketchbook is explicit and needs no such opt-in.
+          # The cache covers ~/Arduino/libraries, so the target already exists on
+          # a cache hit -- remove it first, git clone refuses a non-empty dir.
+          rm -rf "$HOME/Arduino/libraries/ESP32_Host_MIDI"
           git clone --depth 1 --branch "$LIBRARY_TAG" "$LIBRARY_REPO" \
             "$HOME/Arduino/libraries/ESP32_Host_MIDI"
 
