@@ -17,6 +17,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $sb = New-Object Text.StringBuilder
+$line = New-Object Text.StringBuilder
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $cycles = 0
 
@@ -39,8 +40,20 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
           $b = New-Object byte[] $n
           $r = $sp.Read($b, 0, $n)
           if ($r -gt 0) {
-            [void]$sb.Append([Text.Encoding]::UTF8.GetString($b, 0, $r))
-            Write-Host ("[{0,4:N0}s] +{1} bytes (total {2})" -f $sw.Elapsed.TotalSeconds, $r, $sb.Length)
+            $chunk = [Text.Encoding]::UTF8.GetString($b, 0, $r)
+            [void]$sb.Append($chunk)
+            [void]$line.Append($chunk)
+            # Emit whole lines as they complete so progress is visible live
+            # rather than only in the final dump.
+            $txt = $line.ToString()
+            while ($txt.Contains("`n")) {
+              $i = $txt.IndexOf("`n")
+              $one = $txt.Substring(0, $i).TrimEnd("`r")
+              $txt = $txt.Substring($i + 1)
+              if ($one.Length -gt 0) { Write-Host ("  | {0}" -f $one) }
+            }
+            [void]$line.Clear()
+            [void]$line.Append($txt)
           }
         }
       } catch { }
