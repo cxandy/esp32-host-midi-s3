@@ -23,7 +23,8 @@ on:
 env:
   ARDUINO_CLI_VERSION: '1.5.1'
   PLATFORM: esp32:esp32@3.3.12
-  LIBRARY_REPO: https://github.com/sauloverissimo/ESP32_Host_MIDI.git
+  # arduino-cli spells the git ref as a URL fragment: --git-url <url>#<ref>
+  LIBRARY_URL: https://github.com/sauloverissimo/ESP32_Host_MIDI.git#v7.3.0
   LIBRARY_TAG: v7.3.0
   # 3.x lives on Espressif's index, not downloads.arduino.cc.
   ESP32_INDEX: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
@@ -70,7 +71,7 @@ jobs:
           set -euo pipefail
           arduino-cli core update-index --additional-urls "$ESP32_INDEX"
           arduino-cli core install "$PLATFORM" --additional-urls "$ESP32_INDEX"
-          arduino-cli lib install ESP32_Host_MIDI --git-url "$LIBRARY_REPO" --tag "$LIBRARY_TAG"
+          arduino-cli lib install --git-url "$LIBRARY_URL"
 
       - name: Record resolved environment
         run: |
@@ -87,14 +88,20 @@ jobs:
             --fqbn "$FQBN" \
             --warnings all \
             --export-binaries \
+            --build-path build \
             --output-dir out \
             "${{ matrix.sketch }}"
 
       - name: List build output
-        run: ls -lR out
+        run: ls -lR out build
 
       - uses: actions/upload-artifact@v4
         with:
           name: sketch-build-${{ matrix.sketch }}
-          path: out/
+          # out/ has the sketch binaries; build/ additionally carries
+          # bootloader.bin, partitions.bin and boot_app0.bin, which
+          # tools/flash.ps1 needs to write a complete image to the board.
+          path: |
+            out/
+            build/
           if-no-files-found: error
