@@ -9,9 +9,23 @@ name: Build
 # on 2.0.17 src/BLEClientConnection.cpp fails to compile (its ESP_ARDUINO_VERSION
 # 2.x branch assumes a BLEAddress ctor that 2.0.17 does not have). Upgrading the
 # core -- not patching the library -- is the fix.
+#
+# Uses arduino/setup-task + arduino-cli directly rather than
+# arduino/compile-sketches: that action only emits a JSON report, and we need the
+# actual .bin to flash the board.
 on:
   push:
   workflow_dispatch:
+
+env:
+  PLATFORM: esp32:esp32@3.3.12
+  LIBRARY_VERSION: v7.3.0
+  # 3.x lives on Espressif's index, not downloads.arduino.cc.
+  ESP32_INDEX: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+  # PSRAM=opi is mandatory: N16R8 is octal PSRAM, and the generic
+  # PSRAM=enabled (quad) leaves the board reset-looping at boot.
+  FQBN: >-
+    esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
 jobs:
   build:
@@ -28,17 +42,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: arduino/compile-action@v1
+      - name: Install arduino-esp32 and the library
+        uses: arduino/setup-task@v1
         with:
-          sketch-path: ${{ matrix.sketch }}
-          fqbn: >-
-            esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
-          platforms: |
-            - name: esp32:esp32
-              version: 3.3.12
-              source-url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          repositories: |
+            - source-url: ${{ env.ESP32_INDEX }}
+          platform: ${{ env.PLATFORM }}
           libraries: |
             - source: github
               repo: sauloverissimo/ESP32_Host_MIDI
-              version: v7.3.0
-          enable-cache: true
+              version: ${{ env.LIBRARY_VERSION }}
+          cache: true
+
+      - name: Record resolved environment
+        run: |
+          arduino-cli version
+          echo
+          arduino-cli core list
+          echo
+          arduino-cli lib list | grep -i -E 'ESP32_Host_MIDI|MIDI'
+
+      - name: Compile ${{ matrix.sketch }}
+        run: |
+          arduino-cli compile \
+            --fqbn "${{ env.FQBN }}" \
+            --warnings all \
+            --export-binaries \
+            --output-dir out \
+            "${{ matrix.sketch }}"
+
+      - name: List build output
+        run: ls -lR out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sketch-build-${{ matrix.sketch }}
+          path: out/
+          if-no-files-found: error
