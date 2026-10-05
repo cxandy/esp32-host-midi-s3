@@ -65,6 +65,13 @@ jobs:
           # midiHandler.task() dispatches to both.
           - sketch: ProbeE
             fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+          # BLE the other way round: BLEConnection advertises this board as a
+          # GATT server so a phone can connect in as central. ProbeE used
+          # BLEClientConnection, which makes the board scan for a peripheral --
+          # and iOS forbids apps from advertising as a BLE MIDI peripheral, so
+          # that shape can never be tested against a phone.
+          - sketch: ProbeF
+            fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
     steps:
       - uses: actions/checkout@v4
