@@ -51,6 +51,13 @@ jobs:
           # the USB reset path, not the probe or the PSRAM configuration.
           - sketch: ProbeC
             fqbn: esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+          # Instrumented probe: DIN-5 MIDI plus the board's real SH1106 OLED and
+          # buttons. USBMode=hwcdc keeps Serial on the USB-Serial-JTAG port so a
+          # capture is still possible when one can be got; the OLED is I2C and
+          # does not care, which is the point -- it reports "RUNNING" with no
+          # host involved at all. USB Host MIDI will need USBMode=default later.
+          - sketch: ProbeD
+            fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
     steps:
       - uses: actions/checkout@v4
@@ -89,6 +96,10 @@ jobs:
           rm -rf "$HOME/Arduino/libraries/ESP32_Host_MIDI"
           git clone --depth 1 --branch "$LIBRARY_TAG" "$LIBRARY_REPO" \
             "$HOME/Arduino/libraries/ESP32_Host_MIDI"
+          # Only ProbeD needs this: the board's OLED is a SH1106 on I2C and the
+          # project's own port header drives it through U8g2, so match that
+          # rather than inventing a second display stack.
+          arduino-cli lib install U8g2
 
       - name: Record resolved environment
         run: |
