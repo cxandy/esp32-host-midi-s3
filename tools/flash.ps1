@@ -47,23 +47,34 @@ if (-not $esptool) { throw "no esptool.exe found under $esptoolRoot" }
 Write-Host "esptool: $esptool"
 
 # --- resolve artifacts -------------------------------------------------------
+# arduino-cli names the prebuilt images after the sketch
+# (<Sketch>.ino.bootloader.bin / <Sketch>.ino.partitions.bin), so match on the
+# suffix rather than on an exact name. merged.bin is the whole 16 MB flash image
+# -- flashing the four pieces at their own offsets is far quicker than pushing
+# 16 MB, and it leaves the rest of flash alone.
 $ArtifactDir = (Resolve-Path $ArtifactDir).Path
 $app = Get-ChildItem $ArtifactDir -Recurse -Filter '*.bin' |
-  Where-Object { $_.Name -notmatch '^(bootloader|partitions|boot_app0)\.bin$' } |
+  Where-Object { $_.Name -notmatch '(bootloader|partitions|boot_app0|merged)\.bin$' } |
   Sort-Object Length -Descending | Select-Object -First 1
 if (-not $app) { throw "no application .bin under $ArtifactDir" }
 
-$need = 'bootloader.bin', 'partitions.bin', 'boot_app0.bin'
+$need = @{
+  'bootloader.bin' = '*.bootloader.bin'
+  'partitions.bin' = '*.partitions.bin'
+  'boot_app0.bin'  = 'boot_app0.bin'
+}
 $files = @{}
-foreach ($n in $need) {
-  $f = Get-ChildItem $ArtifactDir -Recurse -Filter $n | Select-Object -First 1
-  if (-not $f) { throw "missing $n -- the artifact must include the full CI build path, not just the exported sketch binaries." }
+foreach ($n in $need.Keys) {
+  $f = Get-ChildItem $ArtifactDir -Recurse -Filter $need[$n] | Select-Object -First 1
+  if (-not $f) { throw "missing $($need[$n]) -- the artifact must include the full CI build path, not just the exported sketch binaries." }
   $files[$n] = $f.FullName
 }
 
 Write-Host ""
 Write-Host "app     : $($app.FullName)  ($([math]::Round($app.Length/1KB)) KB)"
-foreach ($n in $need) { Write-Host ("{0,-9}: {1}" -f $n, $files[$n]) }
+foreach ($n in @('bootloader.bin','partitions.bin','boot_app0.bin')) {
+  Write-Host ("{0,-16}: {1}" -f $n, (Split-Path $files[$n] -Leaf))
+}
 Write-Host "port    : $Port  @ $Baud"
 
 # --- flash -------------------------------------------------------------------

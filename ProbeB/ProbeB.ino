@@ -22,6 +22,8 @@ static const int PIN_MIDI_TX = 15;
 UARTConnection dinMIDI;
 static uint64_t lastEventIndex = 0;
 static unsigned long lastBlink = 0;
+static unsigned long lastBeat = 0;
+static unsigned long beatCount = 0;
 
 void setup() {
     Serial.begin(115200);
@@ -82,5 +84,18 @@ void loop() {
     if (millis() - lastBlink > 500) {
         lastBlink = millis();
         digitalWrite(48, !digitalRead(48));
+    }
+
+    // Periodic heartbeat over serial. The setup() banner is printed ~300 ms
+    // after boot, which is easy to miss when the terminal attaches late, so keep
+    // saying something -- this is what makes the probe self-verifying without
+    // needing to win a race against the reset.
+    if (millis() - lastBeat > 2000) {
+        lastBeat = millis();
+        beatCount++;
+        Serial.printf("[ALIVE] #%lu  up=%lus  heap=%u  queue=%u  freePSRAM=%u\n",
+                      beatCount, millis() / 1000, (unsigned)ESP.getFreeHeap(),
+                      (unsigned)midiHandler.getQueue().size(),
+                      (unsigned)ESP.getFreePsram());
     }
 }
