@@ -189,6 +189,11 @@ static uint16_t testMvIo4Pullup = 0;
 //   3 = released (input, nothing driving, for seeing what the board does alone)
 static uint8_t txTestMode = 0;
 
+// Hand-held sweep: serviceSerial()'s 'a' walks the three levels by itself.
+static uint8_t sweepOn = 0;
+static uint8_t sweepPhase = 0;      // 0 = HIGH, 1 = LOW, 2 = hiZ
+static uint32_t sweepAtMs = 0;
+
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
   uint8_t pin;
@@ -228,6 +233,77 @@ static const char* txTestName(uint8_t m) {
     case 3:  return "hiZ";
     default: return "off";
   }
+}
+
+// Changing the OUT level has to be reported the moment it changes, not on the
+// next 5 s beat: whoever is holding a meter on the jack is watching the board,
+// not a log file. `how` says what asked for it (button, serial command, sweep)
+// so the line reads as a cause, not just a state.
+static void setTxTestMode(uint8_t m, const char* how) {
+  txTestMode = m;
+  applyTxTest();
+  char tt[80];
+  if (m) {
+    // analogReadMilliVolts() owns the pad until pinMode() hands it back.
+    uint32_t mv4 = analogReadMilliVolts(MIDI_RX_PIN);
+    pinMode(MIDI_RX_PIN, INPUT);
+    snprintf(tt, sizeof(tt), "%s -> %s io15=%s io4=%umV", how, txTestName(m),
+             m == 3 ? "float"
+                    : (digitalRead(MIDI_TX_PIN) == HIGH ? "HIGH" : "low"),
+             (unsigned)mv4);
+  } else {
+    snprintf(tt, sizeof(tt), "%s -> off, UART owns IO15", how);
+  }
+  logAdd(txTestMode ? txTestName(txTestMode) : "OUT: uart");
+  monPrint("[TXTEST] ", tt);
+  dirty = true;
+}
+
+// ---- serial command channel -------------------------------------------------
+// The buttons need a hand, and a hand is not always at the board. Single
+// characters, no line protocol: whatever arrives is acted on immediately, so a
+// host script over USB can drive the same states the buttons do.
+static void serviceSerial() {
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c < 0) break;
+    switch (c) {
+      case '1': setTxTestMode(1, "cmd"); break;
+      case '0': setTxTestMode(2, "cmd"); break;
+      case 'z': case 'Z': setTxTestMode(3, "cmd"); break;
+      case 'u': case 'U': sweepOn = 0; setTxTestMode(0, "cmd"); break;
+      case 'n': case 'N':
+        setTxTestMode((uint8_t)((txTestMode + 1) % 4), "cmd");
+        break;
+      case 'a': case 'A':
+        // Hands-free: walk HIGH -> LOW -> hiZ on its own every 3 s and report
+        // the IN pad at each step, so a full sweep is one capture instead of
+        // three timed button presses.
+        sweepOn = (uint8_t)!sweepOn;
+        sweepAtMs = millis();
+        if (sweepOn) {
+          sweepPhase = 0;
+          setTxTestMode(1, "sweep start");
+        } else {
+          setTxTestMode(0, "sweep stop");
+        }
+        break;
+      case '?': case 'h': case 'H':
+        monPrint("[CMD] 1 HIGH  0 LOW  z hiZ  u off  n step  a sweep  ? this",
+                 nullptr);
+        break;
+      default:
+        break;   // CR, LF and anything else are ignored on purpose
+    }
+  }
+}
+
+static void serviceSweep() {
+  if (!sweepOn) return;
+  if ((int32_t)(millis() - sweepAtMs) < 3000) return;
+  sweepAtMs = millis();
+  sweepPhase = (uint8_t)((sweepPhase + 1) % 3);
+  setTxTestMode((uint8_t)(sweepPhase + 1), "sweep");
 }
 
 // Put IO15 into (or back out of) the state named by txTestMode. Going back to
@@ -328,6 +404,9 @@ void setup() {
   Serial.setTxTimeoutMs(5);
   delay(300);
   monPrint("[MIDI-MONITOR] ESP32_Host_MIDI + OLED + buttons", nullptr);
+  // Say how to drive the OUT levels without a hand, so a host script (or a
+  // person at a terminal) does not have to read the source to find that out.
+  monPrint("[MIDI-MONITOR] type ? for the serial command list", nullptr);
   bootReason = esp_reset_reason();
   char rst[48];
   snprintf(rst, sizeof(rst), "reset=%s (0x%x)", resetName(bootReason),
@@ -574,7 +653,7 @@ static void render() {
       u8g2.drawHLine(0, 14, 128);
       row(26, "NAV1/2 page  L=fwd");
       row(38, "UP/DN scroll B/D=src");
-      row(50, "hold UP: OUT test");
+      row(50, "hold UP or type: OUT");
       row(62, "D:restart S:download");
       break;
     case 3:
@@ -639,6 +718,11 @@ void loop() {
   midiHandler.task();
   drainQueue();
 
+  // Host commands and the hand-free sweep run before anything else claims
+  // IO15, so a command that arrives mid-iteration still wins that iteration.
+  serviceSerial();
+  serviceSweep();
+
   // ---- DIN-5 self-test: the firmware tests its own loopback ---------------
   // Nothing here needs a phone, a synth or a second device, and it runs in two
   // layers because the serial one alone cannot separate "no signal on the
@@ -667,7 +751,7 @@ void loop() {
     } else if (quietSinceMs == 0) {
       quietSinceMs = millis();
     }
-    if (txTestMode == 0 && millis() - quietSinceMs > 400 &&
+    if (txTestMode == 0 && !sweepOn && millis() - quietSinceMs > 400 &&
         millis() - lastSelfTestMs >= 5000) {
       lastSelfTestMs = millis();
 
@@ -792,26 +876,9 @@ void loop() {
     if (btnUp.longFired) {
       // Hold UP to walk IO15 through the OUT test levels -- see txTestMode.
       // The short press it also fires on the way down still scrolls, which is
-      // what makes this usable one-handed at a bench.
-      txTestMode = (uint8_t)((txTestMode + 1) % 4);
-      applyTxTest();
-      char tt[64];
-      if (txTestMode) {
-        // One reading at the moment of the switch as well as on the 5 s beat:
-        // the meter is usually already on the pin by then.
-        uint32_t mv4 = analogReadMilliVolts(MIDI_RX_PIN);
-        pinMode(MIDI_RX_PIN, INPUT);
-        snprintf(tt, sizeof(tt), "-> %s io15=%s io4=%umV",
-                 txTestName(txTestMode),
-                 txTestMode == 3 ? "float"
-                                 : (digitalRead(MIDI_TX_PIN) == HIGH ? "HIGH"
-                                                                     : "low"),
-                 (unsigned)mv4);
-      } else {
-        snprintf(tt, sizeof(tt), "-> off, UART owns IO15");
-      }
-      monPrint("[TXTEST] ", tt);
-      dirty = true;
+      // what makes this usable one-handed at a bench. Serial 'n' does the same
+      // thing without a hand.
+      setTxTestMode((uint8_t)((txTestMode + 1) % 4), "btn UP");
     } else {
       if (scroll + 4 < logCount) scroll++;
       monPrint("[UI] ", "UP");
