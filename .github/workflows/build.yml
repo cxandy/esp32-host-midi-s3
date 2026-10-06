@@ -159,16 +159,25 @@ jobs:
             --output-dir out \
             "${{ matrix.sketch }}"
 
-      - name: List build output
-        run: ls -lR out build
+      - name: Collect the four flashable images
+        run: |
+          set -euo pipefail
+          # out/ has the three exported sketch images; boot_app0.bin only exists
+          # inside the build tree. Nothing else in build/ is of any use to the
+          # board: the rest of it is the intermediate compile tree (objects,
+          # static libs, generated headers, CMake logs) and uploading it made
+          # the artifact 37 MB, which costs 5-15 minutes per flash iteration on
+          # a slow link to use ~1 MB of payload.
+          mkdir -p flash
+          cp "out/${{ matrix.sketch }}.ino.bin" flash/
+          cp "out/${{ matrix.sketch }}.ino.bootloader.bin" flash/
+          cp "out/${{ matrix.sketch }}.ino.partitions.bin" flash/
+          cp "$(find build -name boot_app0.bin -print -quit)" flash/
+          ls -l flash
+          sha256sum flash/*
 
       - uses: actions/upload-artifact@v4
         with:
           name: sketch-build-${{ matrix.sketch }}
-          # out/ has the sketch binaries; build/ additionally carries
-          # bootloader.bin, partitions.bin and boot_app0.bin, which
-          # tools/flash.ps1 needs to write a complete image to the board.
-          path: |
-            out/
-            build/
+          path: flash/
           if-no-files-found: error

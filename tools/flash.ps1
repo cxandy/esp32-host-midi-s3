@@ -20,8 +20,8 @@
   Serial port. The board enumerates as VID_303A&PID_1001 (Espressif native USB).
 
 .PARAMETER ArtifactDir
-  Directory holding the unzipped artifact: <Sketch>.bin plus bootloader.bin,
-  partitions.bin and boot_app0.bin from the CI build path.
+  Directory holding the unzipped artifact: the sketch's .bin, bootloader.bin,
+  partitions.bin and boot_app0.bin, which is what the CI build uploads.
 
 .PARAMETER Baud
   Flash speed. Drop to 115200 if you get "Failed to connect" on a long cable.
@@ -66,7 +66,7 @@ $need = @{
 $files = @{}
 foreach ($n in $need.Keys) {
   $f = Get-ChildItem $ArtifactDir -Recurse -Filter $need[$n] | Select-Object -First 1
-  if (-not $f) { throw "missing $($need[$n]) -- the artifact must include the full CI build path, not just the exported sketch binaries." }
+  if (-not $f) { throw "missing $($need[$n]) -- the CI artifact should contain the four images in its flash/ directory." }
   $files[$n] = $f.FullName
 }
 
