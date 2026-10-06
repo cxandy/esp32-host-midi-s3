@@ -41,7 +41,6 @@ $sp.Open()
 try {
   if ($Send.Length -gt 0) {
     $sp.Write($Send)
-    $sp.Flush()
     "sent '$Send' to $Port"
   }
 

@@ -194,6 +194,16 @@ static uint8_t sweepOn = 0;
 static uint8_t sweepPhase = 0;      // 0 = HIGH, 1 = LOW, 2 = hiZ
 static uint32_t sweepAtMs = 0;
 
+// The periodic DIN-5 self-test is off by default, and that is a behaviour
+// change, not a default value: it ends the UART every 5 s for ~15 ms, which
+// throws away whatever arrived in that window, and (with the burst below) it
+// plays a phantom C4 at a real synth every 5 s. It earned its keep while the
+// DIN-5 IN path was dead; now that the wiring is fixed it would be the thing
+// causing glitches. Serial 't' turns it back on when the line needs proving
+// again, 'b' adds the six-byte loopback burst.
+static uint8_t diagEnabled = 0;
+static uint8_t burstEnabled = 0;
+
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
   uint8_t pin;
@@ -288,9 +298,25 @@ static void serviceSerial() {
           setTxTestMode(0, "sweep stop");
         }
         break;
+      case 't': case 'T':
+        diagEnabled = (uint8_t)!diagEnabled;
+        monPrint("[DIAG] self-test ", diagEnabled ? "ON (5 s)" : "off");
+        logAdd(diagEnabled ? "diag: on" : "diag: off");
+        dirty = true;
+        break;
+      case 'b': case 'B':
+        burstEnabled = (uint8_t)!burstEnabled;
+        // The burst lives inside the self-test, so asking for it implies
+        // asking for the test.
+        if (burstEnabled) diagEnabled = 1;
+        monPrint("[DIAG] loopback burst ",
+                 burstEnabled ? "ON (C4 every 5 s)" : "off");
+        logAdd(burstEnabled ? "burst: on" : "burst: off");
+        dirty = true;
+        break;
       case '?': case 'h': case 'H':
-        monPrint("[CMD] 1 HIGH  0 LOW  z hiZ  u off  n step  a sweep  ? this",
-                 nullptr);
+        monPrint("[CMD] OUT 1=HIGH 0=LOW z=hiZ u=off n=step a=sweep | "
+                 "diag t=test b=burst | ? this", nullptr);
         break;
       default:
         break;   // CR, LF and anything else are ignored on purpose
@@ -407,6 +433,10 @@ void setup() {
   // Say how to drive the OUT levels without a hand, so a host script (or a
   // person at a terminal) does not have to read the source to find that out.
   monPrint("[MIDI-MONITOR] type ? for the serial command list", nullptr);
+  // The DIN-5 self-test is off by default, so say how to get it back rather
+  // than leaving its absence to be discovered as a missing [TEST] line.
+  monPrint("[DIAG] self-test off -- type t (t=repeat, b=+loopback burst)",
+           nullptr);
   bootReason = esp_reset_reason();
   char rst[48];
   snprintf(rst, sizeof(rst), "reset=%s (0x%x)", resetName(bootReason),
@@ -443,9 +473,14 @@ void setup() {
 
   MIDIHandlerConfig cfg;
   // 64 rather than the default 20: while forwarding, an event sitting in the
-  // queue is a note that has not reached the synth yet, so queue depth is
-  // literally output latency. A 16th-note run at 120 bpm is ~8 notes a second;
-  // 64 gives headroom for a chord-heavy burst without dropping the oldest.
+  // queue is a note that has not reached the synth yet, so queue depth would
+  // be output latency -- except this sketch never removes what it has read.
+  // There is no per-event pop in the library API, and clearQueue() resets the
+  // event indices the display de-duplicates on (MIDIHandler.cpp:321), so the
+  // queue saturates at maxEvents and then evicts the oldest. That is harmless
+  // here: drainQueue() runs every loop iteration, so anything evicted was
+  // already on screen. What it means is that the number is queue pressure, not
+  // latency -- so it is not shown on the OLED, and `rx` is the field to read.
   cfg.maxEvents = 64;
   cfg.bleName = BLE_NAME;
   midiHandler.begin(cfg);
@@ -641,11 +676,15 @@ static void render() {
       } else {
         row(38, "din5 fifo=%u tx=%lu", (unsigned)dinRxFifoPeak,
             (unsigned long)txEvents);
-        row(50, "queue  %u  fail %u",
-            (unsigned)midiHandler.getQueue().size(), (unsigned)fwdFailures);
+        // Events shown, and forwarding failures. Not the library's queue
+        // depth: that saturates at maxEvents because this sketch never pops
+        // what it has read (see cfg.maxEvents), so it would sit at 64 forever
+        // and mean nothing to a person reading the screen.
+        row(50, "din rx %lu f%u", (unsigned long)rxEvents,
+            (unsigned)fwdFailures);
       }
-      row(62, "heap   %u  up %lus", (unsigned)ESP.getFreeHeap(),
-          millis() / 1000);
+      row(62, "heap %u %lus %s", (unsigned)ESP.getFreeHeap(),
+          millis() / 1000, diagEnabled ? "DIAG" : "");
       break;
     }
     case 2:
@@ -751,8 +790,8 @@ void loop() {
     } else if (quietSinceMs == 0) {
       quietSinceMs = millis();
     }
-    if (txTestMode == 0 && !sweepOn && millis() - quietSinceMs > 400 &&
-        millis() - lastSelfTestMs >= 5000) {
+    if (diagEnabled && txTestMode == 0 && !sweepOn &&
+        millis() - quietSinceMs > 400 && millis() - lastSelfTestMs >= 5000) {
       lastSelfTestMs = millis();
 
       // --- layer 1: electrical ------------------------------------------------
@@ -829,7 +868,7 @@ void loop() {
       testPctIo4AtUart = samplePct(MIDI_RX_PIN);
 
       static const uint8_t msg[6] = { 0x90, 60, 100, 0x80, 60, 0 };
-      Serial1.write(msg, sizeof(msg));
+      if (burstEnabled) Serial1.write(msg, sizeof(msg));
       dinSelfTests++;
     }
   }
@@ -951,16 +990,21 @@ void loop() {
     peekHits = 0;
     monPrint(din, nullptr);
 
-    char tst[200];
-    snprintf(tst, sizeof(tst),
-             "[TEST] st=%lu io4hi=%u%% io4lo=%u%% io4pu=%u%% io15hi=%u%% "
-             "io15lo=%u%% io4uart=%u%% mv=%u mvpu=%u",
-             (unsigned long)dinSelfTests, (unsigned)testPctIo4AtHigh,
-             (unsigned)testPctIo4AtLow, (unsigned)testPctIo4Pullup,
-             (unsigned)testPctIo15Read, (unsigned)testPctIo15ReadLow,
-             (unsigned)testPctIo4AtUart, (unsigned)testMvIo4Float,
-             (unsigned)testMvIo4Pullup);
-    monPrint(tst, nullptr);
+    // Only worth printing while the test is the thing running: with diag off
+    // these numbers are frozen history, and a frozen number on a live log is
+    // worse than no number at all.
+    if (diagEnabled) {
+      char tst[200];
+      snprintf(tst, sizeof(tst),
+               "[TEST] st=%lu io4hi=%u%% io4lo=%u%% io4pu=%u%% io15hi=%u%% "
+               "io15lo=%u%% io4uart=%u%% mv=%u mvpu=%u",
+               (unsigned long)dinSelfTests, (unsigned)testPctIo4AtHigh,
+               (unsigned)testPctIo4AtLow, (unsigned)testPctIo4Pullup,
+               (unsigned)testPctIo15Read, (unsigned)testPctIo15ReadLow,
+               (unsigned)testPctIo4AtUart, (unsigned)testMvIo4Float,
+               (unsigned)testMvIo4Pullup);
+      monPrint(tst, nullptr);
+    }
 
     // While IO15 is held for the multimeter: report what the pad is actually
     // driving and what the IN side sees at that moment, so the meter reading
