@@ -205,6 +205,19 @@ static uint32_t sweepAtMs = 0;
 static uint8_t diagEnabled = 0;
 static uint8_t burstEnabled = 0;
 
+// Forward-path loopback, serial 'm'. The bridge's send*() call returning true is
+// not proof that a byte left the board -- it only proves the library accepted
+// it -- and the direct Serial1 burst cannot cover that gap, because it does
+// not go through the library at all. This does: exactly the call the BLE ->
+// DIN-5 bridge makes, once every 3 s, marked with velocity 111 so it cannot be
+// confused with the burst's 100. If it comes back as a `D` event, DIN-5 OUT is
+// verified as an output into a real optocoupler load and the forward path is
+// verified end to end -- with no phone in the loop.
+static uint8_t fwdLoop = 0;
+static uint8_t fwdLoopNoteOn = 0;
+static uint32_t fwdLoopAtMs = 0;
+static uint32_t loopSent = 0, loopFailed = 0;
+
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
   uint8_t pin;
@@ -315,9 +328,18 @@ static void serviceSerial() {
         logAdd(burstEnabled ? "burst: on" : "burst: off");
         dirty = true;
         break;
+      case 'm': case 'M':
+        fwdLoop = (uint8_t)!fwdLoop;
+        fwdLoopAtMs = millis();
+        fwdLoopNoteOn = 0;
+        monPrint("[LOOP] forward-path loopback ",
+                 fwdLoop ? "ON (C4 v111 every 3 s)" : "off");
+        logAdd(fwdLoop ? "loop: on" : "loop: off");
+        dirty = true;
+        break;
       case '?': case 'h': case 'H':
         monPrint("[CMD] OUT 1=HIGH 0=LOW z=hiZ u=off n=step a=sweep | "
-                 "diag t=test b=burst | ? this", nullptr);
+                 "diag t=test b=burst m=fwd-loop | ? this", nullptr);
         break;
       default:
         break;   // CR, LF and anything else are ignored on purpose
@@ -331,6 +353,32 @@ static void serviceSweep() {
   sweepAtMs = millis();
   sweepPhase = (uint8_t)((sweepPhase + 1) % 3);
   setTxTestMode((uint8_t)(sweepPhase + 1), "sweep");
+}
+
+// The note-on and its release are separate calls 200 ms apart, so the loop has
+// to be able to come back between them; nothing here blocks or delays.
+static void serviceFwdLoop() {
+  if (!fwdLoop) return;
+  if (txTestMode || sweepOn) return;   // IO15 belongs to the test modes
+  const uint32_t now = millis();
+  if (fwdLoopNoteOn) {
+    if ((int32_t)(now - fwdLoopAtMs) < 200) return;
+    fwdLoopNoteOn = 0;
+    fwdLoopAtMs = now;
+    midiHandler.sendNoteOff(1, 60, 0, &dinMIDI);
+    monPrint("[LOOP] sendNoteOff C4 -> DIN", nullptr);
+    return;
+  }
+  if ((int32_t)(now - fwdLoopAtMs) < 2800) return;
+  fwdLoopAtMs = now;
+  fwdLoopNoteOn = 1;
+  const bool ok = midiHandler.sendNoteOn(1, 60, 111, &dinMIDI);
+  if (ok) loopSent++; else loopFailed++;
+  char b[56];
+  snprintf(b, sizeof(b), "sendNoteOn C4 v111 -> DIN %s  (ok=%lu fail=%lu)",
+           ok ? "sent" : "REFUSED", (unsigned long)loopSent,
+           (unsigned long)loopFailed);
+  monPrint("[LOOP] ", b);
 }
 
 // Put IO15 into (or back out of) the state named by txTestMode. Going back to
@@ -762,6 +810,7 @@ void loop() {
   // IO15, so a command that arrives mid-iteration still wins that iteration.
   serviceSerial();
   serviceSweep();
+  serviceFwdLoop();
 
   // ---- DIN-5 self-test: the firmware tests its own loopback ---------------
   // Nothing here needs a phone, a synth or a second device, and it runs in two
