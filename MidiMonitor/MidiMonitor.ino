@@ -145,6 +145,7 @@ static uint32_t dinRxLowSamples = 0;
 static uint32_t nav1LowSamples = 0;
 static uint32_t rxAvailHits = 0;
 static uint32_t txFifoBusyHits = 0;
+static uint32_t dinSelfTests = 0;
 
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
@@ -546,6 +547,36 @@ void loop() {
   midiHandler.task();
   drainQueue();
 
+  // ---- DIN-5 self-test: the firmware drives its own loopback ---------------
+  // Nothing here needs a phone or a second device. Every 5 s, once nothing has
+  // arrived for 400 ms (so the burst cannot interleave with a forwarded note
+  // and corrupt it), the sketch writes a NoteOn/NoteOff pair straight to
+  // Serial1 -- bypassing the library's send path on purpose, so `txf` proves
+  // the bytes reached the UART hardware regardless of what the send function
+  // reported. A working loopback brings the same six bytes back in: they show
+  // up as `D` lines, rx climbs while tx does not (the test never enters tx),
+  // and rxav/fifo move with them.
+  //
+  // drainQueue() only forwards events whose source is not dinMIDI, so what
+  // comes back is displayed, not echoed.
+  {
+    static uint32_t lastRxCount = 0;
+    static unsigned long quietSinceMs = 0;
+    static unsigned long lastSelfTestMs = 0;
+    if (rxEvents != lastRxCount) {
+      lastRxCount = rxEvents;
+      quietSinceMs = millis();
+    } else if (quietSinceMs == 0) {
+      quietSinceMs = millis();
+    }
+    if (millis() - quietSinceMs > 400 && millis() - lastSelfTestMs >= 5000) {
+      lastSelfTestMs = millis();
+      static const uint8_t msg[6] = { 0x90, 60, 100, 0x80, 60, 0 };
+      Serial1.write(msg, sizeof(msg));
+      dinSelfTests++;
+    }
+  }
+
   if (bleServer.isConnected()) {
     if (!bleEverConnected) {
       bleEverConnected = true;
@@ -640,12 +671,13 @@ void loop() {
     static uint32_t lastRxAv = 0, lastTxF = 0;
     char din[200];
     snprintf(din, sizeof(din),
-             "[DIN] lo15=%lu lo4=%lu lo2=%lu rxav=%lu txf=%lu",
+             "[DIN] lo15=%lu lo4=%lu lo2=%lu rxav=%lu txf=%lu st=%lu",
              (unsigned long)(dinTxLowSamples - lastLo15),
              (unsigned long)(dinRxLowSamples - lastLo4),
              (unsigned long)(nav1LowSamples - lastLo2),
              (unsigned long)(rxAvailHits - lastRxAv),
-             (unsigned long)(txFifoBusyHits - lastTxF));
+             (unsigned long)(txFifoBusyHits - lastTxF),
+             (unsigned long)dinSelfTests);
     lastLo15 = dinTxLowSamples;
     lastLo4 = dinRxLowSamples;
     lastLo2 = nav1LowSamples;
