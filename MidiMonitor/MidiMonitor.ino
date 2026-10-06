@@ -19,9 +19,11 @@
 // the difference between this and ProbeF, which redrew every 200 ms unconditionally
 // and so paid 31 ms five times a second whether or not the picture had moved.
 //
-// Layout: 3 pages, NAV1/NAV2 to move between them, UP/DOWN to scroll the log,
-// LEFT toggles BLE -> DIN-5 forwarding. Long-press DOWN restarts; long-press
-// SHIFT forces download mode (IO0 low).
+// Layout: 4 pages, NAV1/NAV2 to move between them, UP/DOWN to scroll the log,
+// LEFT toggles BLE -> DIN-5 forwarding. The last page is DIAG: loop counter,
+// worst loop gap, worst single serial print, boot reset reason -- evidence that
+// is visible on the panel even when nobody is reading the COM port. Long-press
+// DOWN restarts; long-press SHIFT forces download mode (IO0 low).
 
 #include <Arduino.h>
 #include <ESP32_Host_MIDI.h>
@@ -68,7 +70,7 @@ static BLEConnection bleServer;
 
 static bool oledOk = false;
 static uint8_t page = 0;
-static const uint8_t pageCount = 3;
+static const uint8_t pageCount = 4;
 
 // ---- Event log -------------------------------------------------------------
 // A ring of the most recent messages. 24 entries x 30 bytes is ~720 bytes of
@@ -95,6 +97,57 @@ static unsigned long bleConnectedForS = 0;
 static bool dirty = true;
 static unsigned long lastRender = 0;
 static unsigned long lastBlink = 0, lastBeat = 0, lastTick = 0;
+
+// ---- Loop/print telemetry ---------------------------------------------------
+// There to answer one question: when the screen and the buttons go dead, is
+// the loop stuck or is only the picture not being drawn? A stuck loop shows up
+// as a large gap between iterations, a stalled serial write as a large single
+// print -- and both are readable on the DIAG page even when nobody is reading
+// the COM port, which is exactly when the fault was last reported.
+static uint32_t loopCount = 0;
+static uint32_t loopGapMaxUs = 0;
+static uint32_t printWorstUs = 0;
+static uint32_t midiSkipped = 0;
+static unsigned long lastLoopUs = 0;
+static unsigned long lastMidiPrintMs = 0;
+static esp_reset_reason_t bootReason = ESP_RST_UNKNOWN;
+
+static const char* resetName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "ext";
+    case ESP_RST_SW:        return "sw";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "intWdt";
+    case ESP_RST_TASK_WDT:  return "taskWdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_DEEPSLEEP: return "sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    case ESP_RST_USB:       return "usb";
+    case ESP_RST_JTAG:      return "jtag";
+    default:                return "other";
+  }
+}
+
+// Every print in this sketch goes through here, and it is timed.
+//
+// HWCDC::write (arduino-esp32 3.3.12, cores/esp32/HWCDC.cpp:540) is not
+// free-running: when the CDC link counts as connected it pushes into a
+// 256-byte ring and, if the host is not draining it, waits tx_timeout_ms per
+// attempt for up to 20 attempts -- 2 s per call at the 100 ms default, during
+// which nothing else in loop() runs. The buttons are polled there, so a burst
+// of output with a slow reader looks exactly like "buttons stopped
+// responding". setup() lowers the timeout to 5 ms; this records what the worst
+// single call actually cost.
+static void monPrint(const char* prefix, const char* body) {
+  unsigned long t0 = micros();
+  Serial.print(prefix);
+  if (body) Serial.println(body);
+  else      Serial.println();
+  unsigned long took = micros() - t0;
+  if (took > printWorstUs) printWorstUs = took;
+}
 
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
@@ -139,9 +192,15 @@ static void logAdd(const char* text) {
 // ---- Setup -----------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  // See monPrint(): the HWCDC default makes one undrained print cost up to 2 s
+  // of loop time, which is a frozen UI with a perfectly healthy firmware.
+  Serial.setTxTimeoutMs(5);
   delay(300);
   Serial.println();
   Serial.println("[MIDI-MONITOR] ESP32_Host_MIDI + OLED + buttons");
+  bootReason = esp_reset_reason();
+  Serial.printf("[MIDI-MONITOR] reset=%s (0x%x)\n", resetName(bootReason),
+                (unsigned)bootReason);
 
   const uint8_t pins[] = { PIN_SHIFT, PIN_NAV1, PIN_NAV2,
                            PIN_DIR_UP, PIN_DIR_DOWN, PIN_DIR_LEFT };
@@ -183,7 +242,7 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
 
   logAdd(oledOk ? "monitor ready" : "OLED MISSING");
-  Serial.printf("[MIDI-MONITOR] advertising as \"%s\"\n", BLE_NAME);
+  monPrint("[MIDI-MONITOR] advertising as ", BLE_NAME);
 }
 
 // ---- Incoming events -------------------------------------------------------
@@ -229,8 +288,16 @@ static void drainQueue() {
       }
     }
     logAdd(line);
-    Serial.print("[MIDI] ");
-    Serial.println(line);
+    // Serial output is a measured cost here, not a free one: 25 lines a second
+    // is more than anyone can read, and every line beyond that is time taken
+    // away from the loop (see monPrint). The ones not written are counted as
+    // `skip` on the DIAG page instead of silently happening.
+    if (millis() - lastMidiPrintMs >= 40) {
+      lastMidiPrintMs = millis();
+      monPrint("[MIDI] ", line);
+    } else {
+      midiSkipped++;
+    }
 
     // ---- BLE -> DIN-5 bridge ------------------------------------------------
     // Every transport the handler is holding except the one this came in on.
@@ -360,6 +427,18 @@ static void render() {
       row(50, "hold DOWN  restart");
       row(62, "hold SHIFT download");
       break;
+    case 3:
+      row(11, "DIAG");
+      u8g2.drawHLine(0, 14, 128);
+      // loop advances every iteration, gapmax is the worst gap ever seen
+      // between two of them: this page says on its own whether the loop is
+      // alive, with nobody reading the COM port required.
+      row(26, "loop %lu", (unsigned long)loopCount);
+      row(38, "gapmax %lums", (unsigned long)(loopGapMaxUs / 1000));
+      row(50, "print %lums x%lu", (unsigned long)(printWorstUs / 1000),
+          (unsigned long)midiSkipped);
+      row(62, "boot %s", resetName(bootReason));
+      break;
   }
 
   // 31 ms on the wire, every call -- the cost measured by ProbeH and not
@@ -370,6 +449,17 @@ static void render() {
 
 // ---- Loop ------------------------------------------------------------------
 void loop() {
+  // Gap between iterations, measured before anything else can delay it. This
+  // is the number that answers "is the loop stuck?" for any cause at all --
+  // serial, I2C, BLE -- not only the ones we happened to think of.
+  uint32_t nowUs = micros();
+  if (lastLoopUs) {
+    uint32_t gap = nowUs - (uint32_t)lastLoopUs;
+    if (gap > loopGapMaxUs) loopGapMaxUs = gap;
+  }
+  lastLoopUs = nowUs;
+  loopCount++;
+
   midiHandler.task();
   drainQueue();
 
@@ -378,35 +468,55 @@ void loop() {
       bleEverConnected = true;
       bleConnectedAtMs = millis();
       logAdd("BLE connected");
-      Serial.println("[BLE] central connected");
+      monPrint("[BLE] ", "central connected");
     }
     bleConnectedForS = (millis() - bleConnectedAtMs) / 1000;
   } else if (bleEverConnected) {
     bleEverConnected = false;
     bleConnectedForS = 0;
     logAdd("BLE dropped");
-    Serial.println("[BLE] central disconnected");
+    monPrint("[BLE] ", "central disconnected");
   }
 
-  if (pollButton(btnNav1)) { page = (page + 1) % pageCount; dirty = true; }
-  if (pollButton(btnNav2)) { page = (page + pageCount - 1) % pageCount; dirty = true; }
+  // Button presses are logged, not just acted on: a capture that shows no
+  // [UI] line while a page is not changing is the difference between "input
+  // path is dead" and "the screen never redrew".
+  if (pollButton(btnNav1)) {
+    page = (page + 1) % pageCount;
+    char what[12];
+    snprintf(what, sizeof(what), "page %u", (unsigned)page);
+    monPrint("[UI] NAV1 -> ", what);
+    dirty = true;
+  }
+  if (pollButton(btnNav2)) {
+    page = (page + pageCount - 1) % pageCount;
+    char what[12];
+    snprintf(what, sizeof(what), "page %u", (unsigned)page);
+    monPrint("[UI] NAV2 -> ", what);
+    dirty = true;
+  }
   if (pollButton(btnLeft)) {
     fwdEnabled = !fwdEnabled;
     logAdd(fwdEnabled ? "fwd ON  -> DIN" : "fwd OFF");
-    Serial.printf("[FWD] BLE -> DIN-5 %s\n", fwdEnabled ? "enabled" : "muted");
+    monPrint("[FWD] BLE -> DIN-5 ", fwdEnabled ? "enabled" : "muted");
     dirty = true;
   }
   if (pollButton(btnUp)) {
     if (scroll + 4 < logCount) scroll++;
+    monPrint("[UI] ", "UP");
     dirty = true;
   }
-  if (pollButton(btnDown) && btnDown.longFired) {
-    Serial.println("[UI] restarting sketch");
+  bool downNow = pollButton(btnDown);
+  if (downNow && !btnDown.longFired) monPrint("[UI] ", "DOWN");
+  if (downNow && btnDown.longFired) {
+    monPrint("[UI] ", "restarting sketch");
     delay(50);
     ESP.restart();
   }
-  if (pollButton(btnShift) && btnShift.longFired) {
-    Serial.println("[UI] forcing download mode: IO0 low + restart");
+  bool shiftNow = pollButton(btnShift);
+  if (shiftNow && !btnShift.longFired) monPrint("[UI] ", "SHIFT");
+  if (shiftNow && btnShift.longFired) {
+    monPrint("[UI] ", "forcing download mode: IO0 low + restart");
     pinMode(PIN_SHIFT, OUTPUT);
     digitalWrite(PIN_SHIFT, LOW);
     delay(50);
@@ -417,9 +527,11 @@ void loop() {
     lastBlink = millis();
     digitalWrite(PIN_LED, !digitalRead(PIN_LED));
   }
-  // The status page counts seconds, so it needs a heartbeat even when nothing
-  // else happens; the log page does not, and stays untouched to save the bus.
-  if (page == 1 && millis() - lastTick > 1000) {
+  // The status and DIAG pages show counters, so they need a heartbeat even
+  // when nothing else happens -- DIAG in particular must keep ticking for it
+  // to mean anything; the log page does not, and stays untouched to save the
+  // bus.
+  if ((page == 1 || page == 3) && millis() - lastTick > 1000) {
     lastTick = millis();
     dirty = true;
   }
@@ -432,14 +544,25 @@ void loop() {
 
   if (millis() - lastBeat > 5000) {
     lastBeat = millis();
-    Serial.printf("[ALIVE] up=%lus heap=%u rx=%lu tx=%lu fail=%u queue=%u "
-                  "ble=%s fwd=%s log=%u/%u\n",
-                  millis() / 1000, (unsigned)ESP.getFreeHeap(),
-                  (unsigned long)rxEvents, (unsigned long)txEvents,
-                  (unsigned)fwdFailures,
-                  (unsigned)midiHandler.getQueue().size(),
-                  bleServer.isConnected() ? "connected" : "advertising",
-                  fwdEnabled ? "on" : "off",
-                  (unsigned)(logCount < LOG_N ? logCount : LOG_N), LOG_N);
+    // One line, built first and printed once, so the timing monPrint records
+    // covers the whole thing. gap/print/skip are the diagnostic fields: gap is
+    // the worst loop stall ever seen, print the worst single serial call, skip
+    // how many event lines were dropped by the rate limiter.
+    char al[200];
+    snprintf(al, sizeof(al),
+             "[ALIVE] up=%lus heap=%u rx=%lu tx=%lu fail=%u queue=%u "
+             "ble=%s fwd=%s log=%u/%u loop=%lu gap=%lums print=%lums skip=%lu "
+             "boot=%s",
+             millis() / 1000, (unsigned)ESP.getFreeHeap(),
+             (unsigned long)rxEvents, (unsigned long)txEvents,
+             (unsigned)fwdFailures,
+             (unsigned)midiHandler.getQueue().size(),
+             bleServer.isConnected() ? "connected" : "advertising",
+             fwdEnabled ? "on" : "off",
+             (unsigned)(logCount < LOG_N ? logCount : LOG_N), LOG_N,
+             (unsigned long)loopCount, (unsigned long)(loopGapMaxUs / 1000),
+             (unsigned long)(printWorstUs / 1000), (unsigned long)midiSkipped,
+             resetName(bootReason));
+    monPrint(al, nullptr);
   }
 }
