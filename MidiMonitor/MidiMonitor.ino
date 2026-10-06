@@ -113,6 +113,14 @@ static unsigned long lastLoopUs = 0;
 static unsigned long lastMidiPrintMs = 0;
 static esp_reset_reason_t bootReason = ESP_RST_UNKNOWN;
 
+// DIN-5 receive is the one path no run has ever exercised (every capture so
+// far is `rx=0` on the wire, 1298/1298 events from BLE). If a test shows
+// nothing on screen, this says which half to blame: `fifo` is the deepest the
+// UART RX FIFO was ever seen holding, sampled before midiHandler.task() eats
+// the bytes. fifo > 0 with no event = the parser dropped them; fifo = 0 with a
+// device plugged in = nothing is arriving at IO4 at all.
+static uint16_t dinRxFifoPeak = 0;
+
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
   uint8_t pin;
@@ -445,8 +453,10 @@ static void render() {
       u8g2.drawHLine(0, 14, 128);
       if (conn) row(26, "ble    conn %lus", bleConnectedForS);
       else      row(26, "ble    advertising");
-      row(38, "din5   tx=%lu%s", (unsigned long)txEvents,
-          fwdEnabled ? "  fwd ON" : "  MUTE");
+      // fifo = deepest the DIN-5 RX FIFO ever got before the library drained
+      // it. Forwarding state lives on page 0's header and in [ALIVE].
+      row(38, "din5 fifo=%u tx=%lu", (unsigned)dinRxFifoPeak,
+          (unsigned long)txEvents);
       row(50, "queue  %u  fail %u",
           (unsigned)midiHandler.getQueue().size(), (unsigned)fwdFailures);
       row(62, "heap   %u  up %lus", (unsigned)ESP.getFreeHeap(),
@@ -493,6 +503,11 @@ void loop() {
   }
   lastLoopUs = nowUs;
   loopCount++;
+
+  // Sample before the library drains it: at 31250 baud a byte sits in the FIFO
+  // for ~320 us while the loop runs every ~14 us, so this cannot miss.
+  int pending = Serial1.available();
+  if (pending > (int)dinRxFifoPeak) dinRxFifoPeak = (uint16_t)pending;
 
   midiHandler.task();
   drainQueue();
@@ -586,7 +601,7 @@ void loop() {
     snprintf(al, sizeof(al),
              "[ALIVE] up=%lus heap=%u rx=%lu tx=%lu fail=%u queue=%u "
              "ble=%s fwd=%s log=%u/%u loop=%lu gap=%lums print=%lums skip=%lu "
-             "boot=%s",
+             "fifo=%u boot=%s",
              millis() / 1000, (unsigned)ESP.getFreeHeap(),
              (unsigned long)rxEvents, (unsigned long)txEvents,
              (unsigned)fwdFailures,
@@ -596,7 +611,7 @@ void loop() {
              (unsigned)(logCount < LOG_N ? logCount : LOG_N), LOG_N,
              (unsigned long)loopCount, (unsigned long)(loopGapMaxUs / 1000),
              (unsigned long)(printWorstUs / 1000), (unsigned long)printSkipped,
-             resetName(bootReason));
+             (unsigned)dinRxFifoPeak, resetName(bootReason));
     monPrint(al, nullptr);
   }
 }
