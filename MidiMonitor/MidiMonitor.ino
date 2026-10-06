@@ -127,16 +127,19 @@ static uint16_t dinRxFifoPeak = 0;
 
 // Where the DIN-5 chain actually breaks, split at the wire.
 //
-// IO15 is the UART TX pad, IO4 the pad behind the MIDI IN optocoupler; a UART
-// idles high, so a pad that reads LOW at rest is not carrying a usable idle
-// state. Four counters, because the first pair alone lied: lo15/lo4 both came
-// back equal to the loop count -- literally LOW on every sample -- which is
-// indistinguishable from a real stuck-low line and from a pad whose input
-// buffer is off. So each reading now carries its own referee:
+// Pad-level truth is NOT taken here any more, and the reason is worth keeping:
+// digitalRead() on a pad the UART owns does not report the pad. With
+// func_sel=UART the read comes from the GPIO side, not the peripheral, so an
+// idle-high TX pad reads LOW and an RX pad reads HIGH whatever the wire is
+// doing -- both were measured here, both looked like hardware faults, and both
+// were the instrument. What can be read reliably while the UART owns the pins:
+// what the peripheral itself reports, and the pads under explicit pinMode(),
+// which is what the opt-in self-test (serial 't') does. So this line carries
+// only counters the peripheral or a plain GPIO can vouch for:
 //
-//   lo2    -- IO2 is a button with INPUT_PULLUP, so it *must* idle high. If it
-//             also counts every loop, digitalRead is the broken part and the
-//             other two numbers say nothing.
+//   nav1   -- IO2 is a button on INPUT_PULLUP, a plain GPIO with no peripheral
+//             attached, so it is the referee for digitalRead itself: it must
+//             idle high, and a non-zero count means a button is held.
 //   rxav   -- loops in which the UART RX FIFO actually held a byte. A line
 //             stuck low is a permanent break: the UART emits 0x00 at 3125 B/s,
 //             so rxav climbs ~15k per 5 s window even though the parser
@@ -144,8 +147,6 @@ static uint16_t dinRxFifoPeak = 0;
 //   txf    -- loops in which the UART TX FIFO was non-empty, i.e. the library's
 //             write really reached the peripheral rather than only returning
 //             true.
-static uint32_t dinTxLowSamples = 0;
-static uint32_t dinRxLowSamples = 0;
 static uint32_t nav1LowSamples = 0;
 static uint32_t rxAvailHits = 0;
 static uint32_t txFifoBusyHits = 0;
@@ -733,8 +734,8 @@ void loop() {
   int pending = Serial1.available();
   if (pending > (int)dinRxFifoPeak) dinRxFifoPeak = (uint16_t)pending;
 
-  if (digitalRead(MIDI_TX_PIN) == LOW) dinTxLowSamples++;
-  if (digitalRead(MIDI_RX_PIN) == LOW) dinRxLowSamples++;
+  // Only IO2 is sampled here: it is a plain GPIO, so unlike the UART pads its
+  // reading is worth having (see the note on the counters above).
   if (digitalRead(PIN_NAV1) == LOW) nav1LowSamples++;
   if (pending > 0) {
     rxAvailHits++;
@@ -966,24 +967,20 @@ void loop() {
     // covers the whole thing. gap/print/skip are the diagnostic fields: gap is
     // the worst loop stall ever seen, print the worst single serial call, skip
     // how many event lines were dropped by the rate limiter.
-    // lo15/lo4 are the physical-layer probe: LOW samples seen on the UART TX
-    // pad and on the pad behind the MIDI IN optocoupler during this 5 s
-    // window, with lo2 as the referee (IO2 has a pull-up, so it must stay 0)
-    // and rxav/txf as the UART-side truth. The line is separate from [ALIVE]
-    // only for length; it prints on the same beat.
-    static uint32_t lastLo15 = 0, lastLo4 = 0, lastLo2 = 0;
+    // nav1 is the referee for digitalRead itself (a plain GPIO that must idle
+    // high), rxav/txf are the UART's own view, and pk is the last byte the
+    // parser was offered -- which is how a dead line (permanent break, only
+    // 0x00 ever seen) differs from a quiet one. The line is separate from
+    // [ALIVE] only for length; it prints on the same beat.
+    static uint32_t lastLo2 = 0;
     static uint32_t lastRxAv = 0, lastTxF = 0;
     char din[200];
     snprintf(din, sizeof(din),
-             "[DIN] lo15=%lu lo4=%lu lo2=%lu rxav=%lu txf=%lu pk=%02X:%lu",
-             (unsigned long)(dinTxLowSamples - lastLo15),
-             (unsigned long)(dinRxLowSamples - lastLo4),
+             "[DIN] nav1=%lu rxav=%lu txf=%lu pk=%02X:%lu",
              (unsigned long)(nav1LowSamples - lastLo2),
              (unsigned long)(rxAvailHits - lastRxAv),
              (unsigned long)(txFifoBusyHits - lastTxF),
              (unsigned)lastPeekByte, (unsigned long)peekHits);
-    lastLo15 = dinTxLowSamples;
-    lastLo4 = dinRxLowSamples;
     lastLo2 = nav1LowSamples;
     lastRxAv = rxAvailHits;
     lastTxF = txFifoBusyHits;

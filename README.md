@@ -44,7 +44,63 @@ BLE path, from a `ProbeE` run, 245 s uptime:
 | OLED usable | SH1106 ACKs at 0x3C on SCL=IO11 / SDA=IO21 |
 | MIDI TX path works | `sendNoteOn/Off` → UART 31250 → IO15, self-test note on C4 |
 | MIDI RX path (BLE) | **verified by `MidiMonitor`**: 1298 events from an iPhone in one 695 s run, `rx=1298 tx=1298 fail=0` |
-| MIDI RX path (DIN-5) | **still unexercised** — `rx=0`, no DIN-5 device or loopback in range |
+| MIDI RX path (DIN-5) | **verified end to end**, both directions — see below |
+
+### The DIN-5 IN fault that was not software
+
+For most of this project's life the DIN-5 IN path produced nothing: `rx=0`, and
+a 6-byte burst sent out of IO15 never came back. It was diagnosed as a hardware
+fault, and every measurement agreed with that. It was not one — the wiring was
+wrong, and the only thing that could have proved it was a probe or a hand.
+
+What the software could establish, all of it on a board whose loopback did not
+close:
+
+- IO15 drive reached the pad (`io15hi=0%` / `io15lo=100%`), and the UART really
+  shifted the six bytes out (`txf` moved with the burst).
+- The IN pad never followed it: `io4hi=100%` **and** `io4lo=100%` means IO4 read
+  LOW for 100% of both windows, with IO15 high and with IO15 low.
+- IO4 sat at 0 mV, and the internal ~45 kΩ pull-up only lifted it to ~780 mV, so
+  something on the board was holding it down rather than leaving it floating.
+- The UART therefore saw a permanent break: `pk=00`, one `0x00` and nothing else,
+  every one of which the parser correctly discarded (data byte, no running
+  status).
+
+After the wiring was corrected, every one of those numbers inverted:
+
+| Reading | Broken wiring | Fixed |
+|---|---|---|
+| `mv` (IO4 at rest) | 0 mV | **3198 mV** (idle = mark) |
+| `mvpu` (IO4 vs 45 kΩ pull-up) | 782 mV | **3198 mV** (nothing holds it down) |
+| `io4hi` (IO4 low while IO15 driven high) | 100% | **0%** |
+| `io4lo` (IO4 low while IO15 driven low) | 100% | **100%** — IO4 follows IO15 |
+| `pk` (last byte the parser saw) | `00` | **`90` / `80` / `64`** |
+| `rx` / `fifo` | 0 / 1 | climbing / 3 |
+| loopback burst | no events | `[MIDI] D ON C4 v100 c1` |
+
+`D` on that last line is the DIN-5 source, which means the whole chain closed in
+one direction: the sketch's own `90 3C 64 / 80 3C 00` → IO15 → OUT driver → jack →
+cable → IN optocoupler → IO4 → UART → parser → display.
+
+### Two instruments that lied, and how they were caught
+
+Both were caught by the firmware disagreeing with itself, which is the reason the
+line-by-line capture is worth more than the OLED.
+
+1. **`digitalRead()` on a UART pad does not read the pad.** With `func_sel=UART`
+   the read comes from the GPIO side rather than the peripheral, so the idle-high
+   TX pad reported LOW on every sample and the IN pad reported HIGH regardless
+   of the wire. Both looked exactly like hardware faults. The giveaway was
+   `lo15 == lo4 == loopCount` on a freshly booted board — a UART cannot be low on
+   every iteration — and `io2` (a plain pull-up GPIO) disagreeing with them. The
+   `lo15`/`lo4` fields are gone; pad-level truth now comes only from the
+   self-test, which reads under an explicit `pinMode()`.
+2. **The library's queue depth is not output latency.** The sketch drains every
+   loop iteration but never pops what it has read — there is no per-event pop in
+   the library API, and `clearQueue()` resets the very event indices the display
+   de-duplicates on. So the queue saturates at `maxEvents` and stays there.
+   Harmless (everything evicted was already on screen) but the STATUS page was
+   showing a number that could never mean anything; it now shows `din rx`.
 
 ## Board
 
@@ -171,7 +227,7 @@ Pages, cycled with NAV-1 (IO2) / NAV-2 (IO1):
 | Page | Shows |
 |---|---|
 | 0 | monitor — last four events newest-at-bottom, `rx tx FWD/MUTE` header; UP/DOWN scrolls |
-| 1 | STATUS — BLE connection age, DIN-5 tx, queue depth + forward failures, heap + uptime |
+| 1 | STATUS — BLE connection age, DIN-5 rx/fifo + forward failures, heap + uptime + `DIAG` flag |
 | 2 | KEYS — the key map |
 | 3 | DIAG — the instrumentation below |
 
@@ -180,6 +236,34 @@ Every button press prints `[UI] <name> -> page N`, so a serial capture can tell
 
 Long-press DOWN restarts the sketch; long-press SHIFT drives IO0 low and
 restarts, which is the in-firmware route back into the ROM downloader.
+
+Long-press UP pins IO15 at a steady level so a multimeter can be put on the OUT
+jack without racing a UART burst — `HIGH` (mark), `LOW` (space), `hiZ`
+(released), then back to the UART.
+
+### Serial command channel
+
+The buttons need a hand, and a hand is not always at the board — the whole
+DIN-5 fault above was only closable because the OUT levels could be driven from
+the host. Open COM8 at 115200, send single characters, no line protocol:
+
+| Key | Does |
+|---|---|
+| `1` / `0` / `z` / `u` | hold IO15 `HIGH` / `LOW` / `hiZ` / give it back to the UART |
+| `n` | step through those four |
+| `a` | toggle the hand-free sweep: `HIGH → LOW → hiZ`, 3 s each, reporting the IN pad at every step |
+| `t` | toggle the DIN-5 self-test (every 5 s) |
+| `b` | toggle the six-byte loopback burst, which implies `t` |
+| `?` | list them |
+
+`tools\serial.ps1 -Send 'a' -Seconds 50` does this from PowerShell.
+
+**Both diagnostics are off by default**, and that is a behaviour change rather
+than a default value: the self-test ends the UART every 5 s for ~15 ms, which
+throws away whatever MIDI arrived in that window, and the burst plays a phantom
+C4 at a real synth every 5 s. They earned their keep while the DIN-5 IN path
+was dead; with the wiring fixed they would be the thing causing glitches. `t`
+and `b` bring them back.
 
 ### DIAG page — how to read it
 
