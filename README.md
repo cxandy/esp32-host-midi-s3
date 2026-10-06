@@ -43,7 +43,8 @@ BLE path, from a `ProbeE` run, 245 s uptime:
 | No heap leak under BLE scanning | sawtooth 217.4k–219.8k with no downward trend; BLE costs ~113 KB vs 331 kB baseline |
 | OLED usable | SH1106 ACKs at 0x3C on SCL=IO11 / SDA=IO21 |
 | MIDI TX path works | `sendNoteOn/Off` → UART 31250 → IO15, self-test note on C4 |
-| MIDI RX path | **not yet exercised** — `rx=0`, no DIN-5 device or BLE peripheral in range |
+| MIDI RX path (BLE) | **verified by `MidiMonitor`**: 1298 events from an iPhone in one 695 s run, `rx=1298 tx=1298 fail=0` |
+| MIDI RX path (DIN-5) | **still unexercised** — `rx=0`, no DIN-5 device or loopback in range |
 
 ## Board
 
@@ -108,6 +109,10 @@ different board. See "Next steps".
 | `ProbeC` | No library, no PSRAM, output on USB-Serial-JTAG. Isolates "can any sketch boot" from "is the probe or the PSRAM config wrong". |
 | `ProbeD` | DIN-5 MIDI **plus** the board's SH1106 OLED and buttons. The instrumented one. |
 | `ProbeE` | DIN-5 UART **and** `BLEClientConnection` as BLE central, two transports at once. Proves the most version-fragile file in the library. |
+| `ProbeF` | DIN-5 out and BLE in **together**, 305 s, real notes from an iPhone — both transports on one board. |
+| `ProbeG` | Measures the OLED stall instead of assuming a cause. |
+| `ProbeH` | Separates OLED RAM cost from bus cost at three bus speeds: `sendBuffer()` is 31 ms regardless, so the bus is already at its ceiling. |
+| `MidiMonitor` | **The application**, not a probe: monitor + BLE→DIN-5 bridge + the DIAG page described below. |
 
 ### ProbeD: OLED and buttons
 
@@ -147,6 +152,90 @@ LED       = IO48
 
 The OLED constructor matches the board's own port header
 (`src/ports/esp32/esp32s3.h`) rather than inventing a second display stack.
+
+## MidiMonitor — the application
+
+`MidiMonitor/` is what all of the above was for: a MIDI monitor that runs on the
+board itself — OLED, buttons, both transports — with a BLE → DIN-5 bridge
+underneath. The AciduinoV2Box firmware is out of scope here; only its pin map
+was borrowed.
+
+DIN-5 on IO4/IO15, plus a BLE peripheral advertising as `ESP32-S3 MIDI` that a
+phone connects to as central (the direction iOS allows — an iOS app cannot
+advertise as a peripheral). Forwarding is **BLE → DIN-5 only**, on by default,
+toggled with DIR LEFT: one-way on purpose, because a two-way bridge echoes the
+phone's own notes straight back at it.
+
+Pages, cycled with NAV-1 (IO2) / NAV-2 (IO1):
+
+| Page | Shows |
+|---|---|
+| 0 | monitor — last four events newest-at-bottom, `rx tx FWD/MUTE` header; UP/DOWN scrolls |
+| 1 | STATUS — BLE connection age, DIN-5 tx, queue depth + forward failures, heap + uptime |
+| 2 | KEYS — the key map |
+| 3 | DIAG — the instrumentation below |
+
+Every button press prints `[UI] <name> -> page N`, so a serial capture can tell
+"the input path is dead" from "the screen simply never redrew".
+
+Long-press DOWN restarts the sketch; long-press SHIFT drives IO0 low and
+restarts, which is the in-firmware route back into the ROM downloader.
+
+### DIAG page — how to read it
+
+| Field | Normal | When it is not normal |
+|---|---|---|
+| `loop` | advancing every second (~70 k/s) | **frozen = `loop()` itself is stuck.** The buttons and the display are both polled there, so this one number separates "the firmware hung" from "only the picture stopped". Readable with no COM port open. |
+| `gapmax` | ≈32 ms | worst gap ever seen between two loop iterations. 32 ms is exactly one `sendBuffer()` (ProbeH), i.e. a redraw. Hundreds of ms or seconds = a blocking call, and the usual suspects are serial and I2C. |
+| `print` | 0 ms | worst single `Serial` write. See the freeze below. |
+| `x<n>` beside it | grows only when nobody is draining the port | prints deliberately dropped instead of blocking — counted, not hidden. |
+| `boot` | reason for the last reset | `usb` = raised from the USB side, `panic` / `taskWdt` = the firmware died, `poweron` / `ext` = real reset. |
+
+### The freeze, and why serial was the cause
+
+Symptom: once a BLE central connected and MIDI arrived, the buttons stopped
+responding, with no crash and no log line to explain it.
+
+The cause came from reading `cores/esp32/HWCDC.cpp` in arduino-esp32 3.3.12 and
+then measuring it on the board:
+
+- `HWCDC::write` pushes into a **256-byte** ring. When the host is not draining
+  it, each write waits `tx_timeout_ms` and retries, up to **20 attempts**
+  (`HWCDC.cpp:581`, `max_consec_timeouts = 20`).
+- `tx_timeout_ms` defaults to **100 ms** (`HWCDC.cpp:105`), so a single
+  `Serial.print` could block `loop()` for **2 s** — and `loop()` is where the
+  buttons are polled and the screen is drawn.
+- The sketch printed one line per MIDI event, so the first burst after a BLE
+  connection stalled the loop long enough to read as a hang.
+
+Measured, same board, before and after:
+
+| | before | after |
+|---|---|---|
+| `print` | 100 ms — the retry cap already hit at a 5 ms timeout; 2000 ms at the stock 100 ms | 0 ms |
+| `gapmax` | 100 ms, spent inside `Serial.write` | 32 ms — one redraw |
+| 695 s with 1298 notes | reset `rst:0x15` mid-burst | no reset, `rx=1298 tx=1298 fail=0` |
+
+Four changes, all inside `MidiMonitor.ino` — the library is untouched:
+
+1. `Serial.setTxTimeoutMs(5)` — bounds a blocking write to 100 ms, not 2 s.
+2. `monPrint()` checks `availableForWrite()` against the line length first and
+   **skips instead of blocking**; skipped lines land in `skip`.
+3. Each line is built in one buffer and written once. Two writes meant the host
+   could stop draining between them, drop the tail, and leave a bare `[MIDI] `
+   prefix with the next line glued on — which reads exactly like memory
+   corruption, and nearly sent this investigation down the wrong path.
+4. Event lines are rate-limited to 25/s.
+
+A healthy capture now reads:
+
+```
+[ALIVE] up=455s heap=211948 rx=1298 tx=1298 fail=0 queue=64 ble=connected
+        fwd=on log=24/24 loop=30917474 gap=34ms print=0ms skip=940 boot=usb
+```
+
+`rx == tx` with `fail=0` is the bridge working: every note the phone sent left
+the DIN-5 output.
 
 ## Build
 
