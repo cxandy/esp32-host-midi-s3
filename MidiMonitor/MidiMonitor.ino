@@ -33,6 +33,12 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <esp_system.h>
+// Only for the electrical self-test: pinMode() cannot express "output and
+// readable at the same time", and taking a pad over from the UART with the
+// input buffer off would make the test report a stuck-low IO15 that it created
+// itself. gpio_reset_pin() also puts the pad's output source back under GPIO
+// control, which matters because Serial1 was driving it from the peripheral.
+#include <driver/gpio.h>
 
 // ---- Board pin map ---------------------------------------------------------
 #define PIN_OLED_SCL   11
@@ -586,7 +592,9 @@ void loop() {
 
       // --- layer 1: electrical ------------------------------------------------
       Serial1.end();
-      pinMode(MIDI_TX_PIN, OUTPUT);
+      gpio_reset_pin((gpio_num_t)MIDI_TX_PIN);                     // GPIO back in charge
+      gpio_set_direction((gpio_num_t)MIDI_TX_PIN, GPIO_MODE_INPUT_OUTPUT);
+      gpio_set_direction((gpio_num_t)MIDI_RX_PIN, GPIO_MODE_INPUT); // input buffer on
 
       digitalWrite(MIDI_TX_PIN, HIGH);
       uint32_t lo4High = 0, lo15High = 0, nHigh = 0;
