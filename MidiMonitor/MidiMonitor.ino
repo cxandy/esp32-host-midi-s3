@@ -177,6 +177,18 @@ static uint8_t testPctIo15ReadLow = 0;
 static uint16_t testMvIo4Float = 0;
 static uint16_t testMvIo4Pullup = 0;
 
+// ---- DIN-5 OUT test levels -------------------------------------------------
+// Long-press UP pins IO15 (the DIN-5 OUT driver's input) at one steady level
+// so a multimeter can be put on the jack without racing a UART burst. The
+// periodic self-test is suspended while this is active: that test takes IO15
+// over too, and two owners fighting for one pad is how you end up measuring
+// neither.
+//   0 = off, the UART owns IO15 again
+//   1 = held HIGH (mark -- the level that should carry no loop current)
+//   2 = held LOW  (space -- the level that should switch loop current on)
+//   3 = released (input, nothing driving, for seeing what the board does alone)
+static uint8_t txTestMode = 0;
+
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
   uint8_t pin;
@@ -207,6 +219,34 @@ static bool pollButton(Button& b) {
     b.held = false;
   }
   return fired;
+}
+
+static const char* txTestName(uint8_t m) {
+  switch (m) {
+    case 1:  return "HIGH";
+    case 2:  return "LOW";
+    case 3:  return "hiZ";
+    default: return "off";
+  }
+}
+
+// Put IO15 into (or back out of) the state named by txTestMode. Going back to
+// 0 re-opens the UART rather than just re-attaching it: begin() on a running
+// port can return early on an unchanged configuration and leave the pad routed
+// to GPIO, which would mean "off" never comes back.
+static void applyTxTest() {
+  if (txTestMode == 0) {
+    Serial1.end();
+    Serial1.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
+    return;
+  }
+  if (txTestMode == 3) {
+    pinMode(MIDI_TX_PIN, INPUT);
+    gpio_set_pull_mode((gpio_num_t)MIDI_TX_PIN, GPIO_FLOATING);
+    return;
+  }
+  pinMode(MIDI_TX_PIN, OUTPUT);
+  digitalWrite(MIDI_TX_PIN, txTestMode == 1 ? HIGH : LOW);
 }
 
 // ---- Print path -------------------------------------------------------------
@@ -511,10 +551,20 @@ static void render() {
       else      row(26, "ble    advertising");
       // fifo = deepest the DIN-5 RX FIFO ever got before the library drained
       // it. Forwarding state lives on page 0's header and in [ALIVE].
-      row(38, "din5 fifo=%u tx=%lu", (unsigned)dinRxFifoPeak,
-          (unsigned long)txEvents);
-      row(50, "queue  %u  fail %u",
-          (unsigned)midiHandler.getQueue().size(), (unsigned)fwdFailures);
+      if (txTestMode) {
+        // Multimeter mode: where IO15 is pinned and what the IN pad says at
+        // that moment, so the meter and the screen can be read together.
+        row(38, "txtest %s io15=%s", txTestName(txTestMode),
+            txTestMode == 3 ? "f"
+                            : (digitalRead(MIDI_TX_PIN) == HIGH ? "H" : "L"));
+        row(50, "io4=%umV", (unsigned)analogReadMilliVolts(MIDI_RX_PIN));
+        pinMode(MIDI_RX_PIN, INPUT);
+      } else {
+        row(38, "din5 fifo=%u tx=%lu", (unsigned)dinRxFifoPeak,
+            (unsigned long)txEvents);
+        row(50, "queue  %u  fail %u",
+            (unsigned)midiHandler.getQueue().size(), (unsigned)fwdFailures);
+      }
       row(62, "heap   %u  up %lus", (unsigned)ESP.getFreeHeap(),
           millis() / 1000);
       break;
@@ -524,8 +574,8 @@ static void render() {
       u8g2.drawHLine(0, 14, 128);
       row(26, "NAV1/2 page  L=fwd");
       row(38, "UP/DN scroll B/D=src");
-      row(50, "hold DOWN  restart");
-      row(62, "hold SHIFT download");
+      row(50, "hold UP: OUT test");
+      row(62, "D:restart S:download");
       break;
     case 3:
       row(11, "DIAG");
@@ -617,7 +667,8 @@ void loop() {
     } else if (quietSinceMs == 0) {
       quietSinceMs = millis();
     }
-    if (millis() - quietSinceMs > 400 && millis() - lastSelfTestMs >= 5000) {
+    if (txTestMode == 0 && millis() - quietSinceMs > 400 &&
+        millis() - lastSelfTestMs >= 5000) {
       lastSelfTestMs = millis();
 
       // --- layer 1: electrical ------------------------------------------------
@@ -738,9 +789,34 @@ void loop() {
     dirty = true;
   }
   if (pollButton(btnUp)) {
-    if (scroll + 4 < logCount) scroll++;
-    monPrint("[UI] ", "UP");
-    dirty = true;
+    if (btnUp.longFired) {
+      // Hold UP to walk IO15 through the OUT test levels -- see txTestMode.
+      // The short press it also fires on the way down still scrolls, which is
+      // what makes this usable one-handed at a bench.
+      txTestMode = (uint8_t)((txTestMode + 1) % 4);
+      applyTxTest();
+      char tt[64];
+      if (txTestMode) {
+        // One reading at the moment of the switch as well as on the 5 s beat:
+        // the meter is usually already on the pin by then.
+        uint32_t mv4 = analogReadMilliVolts(MIDI_RX_PIN);
+        pinMode(MIDI_RX_PIN, INPUT);
+        snprintf(tt, sizeof(tt), "-> %s io15=%s io4=%umV",
+                 txTestName(txTestMode),
+                 txTestMode == 3 ? "float"
+                                 : (digitalRead(MIDI_TX_PIN) == HIGH ? "HIGH"
+                                                                     : "low"),
+                 (unsigned)mv4);
+      } else {
+        snprintf(tt, sizeof(tt), "-> off, UART owns IO15");
+      }
+      monPrint("[TXTEST] ", tt);
+      dirty = true;
+    } else {
+      if (scroll + 4 < logCount) scroll++;
+      monPrint("[UI] ", "UP");
+      dirty = true;
+    }
   }
   bool downNow = pollButton(btnDown);
   if (downNow && !btnDown.longFired) monPrint("[UI] ", "DOWN");
@@ -818,6 +894,23 @@ void loop() {
              (unsigned)testPctIo4AtUart, (unsigned)testMvIo4Float,
              (unsigned)testMvIo4Pullup);
     monPrint(tst, nullptr);
+
+    // While IO15 is held for the multimeter: report what the pad is actually
+    // driving and what the IN side sees at that moment, so the meter reading
+    // and this line can be read against each other. analogReadMilliVolts()
+    // takes IO4 over until pinMode() puts it back as a GPIO.
+    if (txTestMode) {
+      uint32_t mv4 = analogReadMilliVolts(MIDI_RX_PIN);
+      pinMode(MIDI_RX_PIN, INPUT);
+      char ttx[200];
+      snprintf(ttx, sizeof(ttx), "[TXTEST] mode=%s io15=%s io4=%umV",
+               txTestName(txTestMode),
+               txTestMode == 3 ? "float"
+                               : (digitalRead(MIDI_TX_PIN) == HIGH ? "HIGH"
+                                                                   : "low"),
+               (unsigned)mv4);
+      monPrint(ttx, nullptr);
+    }
 
     char al[200];
     snprintf(al, sizeof(al),
