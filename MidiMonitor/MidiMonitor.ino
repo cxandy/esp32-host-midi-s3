@@ -33,11 +33,9 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <esp_system.h>
-// Only for the electrical self-test: pinMode() cannot express "output and
-// readable at the same time", and taking a pad over from the UART with the
-// input buffer off would make the test report a stuck-low IO15 that it created
-// itself. gpio_reset_pin() also puts the pad's output source back under GPIO
-// control, which matters because Serial1 was driving it from the peripheral.
+// gpio_set_pull_mode(), for the electrical self-test: the sketch has to take
+// its own pull-up on and off around IO4, and pinMode() has no "no pull"
+// variant that does not also change the direction.
 #include <driver/gpio.h>
 
 // ---- Board pin map ---------------------------------------------------------
@@ -151,6 +149,10 @@ static uint32_t dinRxLowSamples = 0;
 static uint32_t nav1LowSamples = 0;
 static uint32_t rxAvailHits = 0;
 static uint32_t txFifoBusyHits = 0;
+// The last byte that showed up in the DIN-5 RX FIFO (see the peek() comment
+// in loop) and how many times something showed up since the last [DIN] line.
+static uint8_t lastPeekByte = 0;
+static uint32_t peekHits = 0;
 static uint32_t dinSelfTests = 0;
 // Result of the last electrical self-test, as percent of samples that read
 // LOW: io4 while IO15 is driven high / low, and IO15 read back while driven
@@ -166,6 +168,14 @@ static uint8_t testPctIo15Read = 0;
 // level).
 static uint8_t testPctIo4Pullup = 0;
 static uint8_t testPctIo4AtUart = 0;
+// IO15 read back while driven low: together with testPctIo15Read (driven high)
+// this is the proof that our own drive reaches the pad. Anything other than
+// 0% / 100% means the electrical test measured the pad's idle state instead.
+static uint8_t testPctIo15ReadLow = 0;
+// ADC millivolts on IO4, floating and against the internal pull-up: the
+// quantitative answer to "who pulls this down" that digitalRead cannot give.
+static uint16_t testMvIo4Float = 0;
+static uint16_t testMvIo4Pullup = 0;
 
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
@@ -558,7 +568,19 @@ void loop() {
   if (digitalRead(MIDI_TX_PIN) == LOW) dinTxLowSamples++;
   if (digitalRead(MIDI_RX_PIN) == LOW) dinRxLowSamples++;
   if (digitalRead(PIN_NAV1) == LOW) nav1LowSamples++;
-  if (pending > 0) rxAvailHits++;
+  if (pending > 0) {
+    rxAvailHits++;
+    // What exactly arrived? The parser discards a data byte that has no status
+    // byte in front of it (UARTConnection.cpp:136), so a byte can enter the
+    // FIFO and leave no trace in the monitor. peek() leaves it for the library
+    // to consume; a lone 0x00 means "break", 0x90 means one of our own six
+    // bytes actually came back.
+    int v = Serial1.peek();
+    if (v >= 0) {
+      lastPeekByte = (uint8_t)v;
+      peekHits++;
+    }
+  }
   // 128 is the hardware FIFO depth: anything less means bytes are sitting in
   // the transmitter right now. It also reads 0 before the UART is begun, so
   // txf pinned at the loop count is itself a finding, not a measurement.
@@ -599,21 +621,35 @@ void loop() {
       lastSelfTestMs = millis();
 
       // --- layer 1: electrical ------------------------------------------------
-      // Five readings, each 1.5 ms of samples, chosen so that every failure
+      // Seven readings, each 1.5 ms of samples, chosen so that every failure
       // mode has its own number instead of sharing one ambiguous "it reads
       // low":
-      //   io4hi  IO4 while IO15 is driven high (mark) -- who holds it?
-      //   io4lo  IO4 while IO15 is driven low  (space) -- does it follow?
-      //   io4pu  IO4 with a pull-up on top     -- driven low, or just floating?
-      //   io15hi IO15 read back while we drive it high -- is our own drive
-      //          visible to digitalRead at all?
+      //   io4hi   IO4 while IO15 is driven high (mark) -- who holds it?
+      //   io4lo   IO4 while IO15 is driven low  (space) -- does it follow?
+      //   io4pu   IO4 with a pull-up on top     -- driven low, or just floating?
+      //   io15hi  IO15 read back while driven high -- must be 0%
+      //   io15lo  IO15 read back while driven low  -- must be 100%
       //   io4uart IO4 immediately after the UART is re-opened -- if this
-      //          differs from io4hi, the UART's own pin setup is what changes
-      //          the pad, not the circuit.
+      //           differs from io4hi, the UART's own pin setup is what changes
+      //           the pad, not the circuit.
+      // io15hi/io15lo are the check that the other five mean anything: driving
+      // through gpio_set_direction() without pinMode() leaves the peripheral
+      // manager unregistered and digitalWrite() then does nothing at all
+      // (esp32-hal-gpio.c:182), which reports a perfectly plausible-looking
+      // "I drove it high" as a pad that never moved.
+      //
+      // pinMode() is used for exactly that reason -- it registers the pin as a
+      // GPIO bus, and its mode mask turns OUTPUT into GPIO_MODE_INPUT_OUTPUT,
+      // so the pad keeps its input buffer while we drive it.
       Serial1.end();
-      gpio_reset_pin((gpio_num_t)MIDI_TX_PIN);                     // GPIO back in charge
-      gpio_set_direction((gpio_num_t)MIDI_TX_PIN, GPIO_MODE_INPUT_OUTPUT);
-      gpio_set_direction((gpio_num_t)MIDI_RX_PIN, GPIO_MODE_INPUT); // input buffer on
+      // pinMode() does everything this needs: it registers the pin with the
+      // peripheral manager (which is what makes digitalWrite() do anything at
+      // all, esp32-hal-gpio.c:182) and gpio_config() re-selects the pad as
+      // GPIO (idf gpio.c:427). Its mode mask turns OUTPUT into
+      // GPIO_MODE_INPUT_OUTPUT, so the pad keeps its input buffer while we
+      // drive it -- which is what lets us read our own drive back.
+      pinMode(MIDI_TX_PIN, OUTPUT);
+      pinMode(MIDI_RX_PIN, INPUT);
       gpio_set_pull_mode((gpio_num_t)MIDI_RX_PIN, GPIO_FLOATING);   // no help from us
 
       auto samplePct = [](uint8_t pin) {
@@ -632,11 +668,24 @@ void loop() {
 
       digitalWrite(MIDI_TX_PIN, LOW);
       testPctIo4AtLow = samplePct(MIDI_RX_PIN);
+      testPctIo15ReadLow = samplePct(MIDI_TX_PIN);
 
       digitalWrite(MIDI_TX_PIN, HIGH);
       gpio_set_pull_mode((gpio_num_t)MIDI_RX_PIN, GPIO_PULLUP_ONLY);
       testPctIo4Pullup = samplePct(MIDI_RX_PIN);
       gpio_set_pull_mode((gpio_num_t)MIDI_RX_PIN, GPIO_FLOATING);
+
+      // How hard is IO4 being held down? digitalRead only says "< Vih"; the
+      // ADC says how much. Against the ~45 kOhm internal pull-up a board
+      // pull-down lands around 0.5 V, a saturated opto collector near 0 V,
+      // and a healthy idle line at 3.3 V. Last measurements of the block,
+      // because analogReadMilliVolts() takes the pad over until pinMode()
+      // runs again.
+      testMvIo4Float = analogReadMilliVolts(MIDI_RX_PIN);
+      gpio_set_pull_mode((gpio_num_t)MIDI_RX_PIN, GPIO_PULLUP_ONLY);
+      testMvIo4Pullup = analogReadMilliVolts(MIDI_RX_PIN);
+      gpio_set_pull_mode((gpio_num_t)MIDI_RX_PIN, GPIO_FLOATING);
+      pinMode(MIDI_RX_PIN, INPUT);
 
       // --- layer 2: serial ----------------------------------------------------
       // Re-open rather than begin(): end() released the pad routing, and the
@@ -744,27 +793,30 @@ void loop() {
     static uint32_t lastRxAv = 0, lastTxF = 0;
     char din[200];
     snprintf(din, sizeof(din),
-             "[DIN] lo15=%lu lo4=%lu lo2=%lu rxav=%lu txf=%lu st=%lu",
+             "[DIN] lo15=%lu lo4=%lu lo2=%lu rxav=%lu txf=%lu pk=%02X:%lu",
              (unsigned long)(dinTxLowSamples - lastLo15),
              (unsigned long)(dinRxLowSamples - lastLo4),
              (unsigned long)(nav1LowSamples - lastLo2),
              (unsigned long)(rxAvailHits - lastRxAv),
              (unsigned long)(txFifoBusyHits - lastTxF),
-             (unsigned long)dinSelfTests);
+             (unsigned)lastPeekByte, (unsigned long)peekHits);
     lastLo15 = dinTxLowSamples;
     lastLo4 = dinRxLowSamples;
     lastLo2 = nav1LowSamples;
     lastRxAv = rxAvailHits;
     lastTxF = txFifoBusyHits;
+    peekHits = 0;
     monPrint(din, nullptr);
 
     char tst[200];
     snprintf(tst, sizeof(tst),
              "[TEST] st=%lu io4hi=%u%% io4lo=%u%% io4pu=%u%% io15hi=%u%% "
-             "io4uart=%u%%",
+             "io15lo=%u%% io4uart=%u%% mv=%u mvpu=%u",
              (unsigned long)dinSelfTests, (unsigned)testPctIo4AtHigh,
              (unsigned)testPctIo4AtLow, (unsigned)testPctIo4Pullup,
-             (unsigned)testPctIo15Read, (unsigned)testPctIo4AtUart);
+             (unsigned)testPctIo15Read, (unsigned)testPctIo15ReadLow,
+             (unsigned)testPctIo4AtUart, (unsigned)testMvIo4Float,
+             (unsigned)testMvIo4Pullup);
     monPrint(tst, nullptr);
 
     char al[200];
