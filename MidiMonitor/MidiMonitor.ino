@@ -115,6 +115,10 @@ static uint32_t printWorstUs = 0;
 static uint32_t printSkipped = 0;
 static unsigned long lastLoopUs = 0;
 static unsigned long lastMidiPrintMs = 0;
+// Which transport the last printed event came from -- see the rate limiter in
+// drainQueue().
+static uint8_t lastPrintedFromDin = 0;
+static uint32_t rxFromBle = 0, rxFromDin = 0;
 static esp_reset_reason_t bootReason = ESP_RST_UNKNOWN;
 
 // DIN-5 receive is the one path no run has ever exercised (every capture so
@@ -547,6 +551,12 @@ static void drainQueue() {
     if (ev.index <= lastEventIndex) continue;
     lastEventIndex = ev.index;
     rxEvents++;
+    // Counted per source rather than read off the log. The serial print is
+    // rate limited, and a loopback makes that useless for exactly the question
+    // it matters for: the BLE event prints, then its own echo arrives ~2 ms
+    // later and is dropped by the same 40 ms window, so `D` never appears even
+    // though the round trip happened. Two numbers survive that.
+    if (ev.source == &dinMIDI) rxFromDin++; else rxFromBle++;
 
     char noteBuf[8];
     char line[30];
@@ -593,8 +603,13 @@ static void drainQueue() {
     // is more than anyone can read, and every line beyond that is time taken
     // away from the loop (see monPrint). The ones not written are counted as
     // `skip` on the DIAG page instead of silently happening.
-    if (millis() - lastMidiPrintMs >= 40) {
+    // A source switch always prints, even inside the rate-limit window: the
+    // pair that matters (B out, D back) arrives ~2 ms apart, so a flat limit
+    // would always print the first and drop the second.
+    const bool sourceChanged = (ev.source == &dinMIDI) != lastPrintedFromDin;
+    if (sourceChanged || millis() - lastMidiPrintMs >= 40) {
       lastMidiPrintMs = millis();
+      lastPrintedFromDin = (ev.source == &dinMIDI);
       monPrint("[MIDI] ", tagged);
     } else {
       printSkipped++;
@@ -1023,14 +1038,19 @@ void loop() {
     // [ALIVE] only for length; it prints on the same beat.
     static uint32_t lastLo2 = 0;
     static uint32_t lastRxAv = 0, lastTxF = 0;
+    static uint32_t lastBle = 0, lastDin = 0;
     char din[200];
     snprintf(din, sizeof(din),
-             "[DIN] nav1=%lu rxav=%lu txf=%lu pk=%02X:%lu",
+             "[DIN] nav1=%lu ble=%lu din=%lu rxav=%lu txf=%lu pk=%02X:%lu",
              (unsigned long)(nav1LowSamples - lastLo2),
+             (unsigned long)(rxFromBle - lastBle),
+             (unsigned long)(rxFromDin - lastDin),
              (unsigned long)(rxAvailHits - lastRxAv),
              (unsigned long)(txFifoBusyHits - lastTxF),
              (unsigned)lastPeekByte, (unsigned long)peekHits);
     lastLo2 = nav1LowSamples;
+    lastBle = rxFromBle;
+    lastDin = rxFromDin;
     lastRxAv = rxAvailHits;
     lastTxF = txFifoBusyHits;
     peekHits = 0;
