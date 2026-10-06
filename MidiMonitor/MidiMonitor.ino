@@ -107,7 +107,7 @@ static unsigned long lastBlink = 0, lastBeat = 0, lastTick = 0;
 static uint32_t loopCount = 0;
 static uint32_t loopGapMaxUs = 0;
 static uint32_t printWorstUs = 0;
-static uint32_t midiSkipped = 0;
+static uint32_t printSkipped = 0;
 static unsigned long lastLoopUs = 0;
 static unsigned long lastMidiPrintMs = 0;
 static esp_reset_reason_t bootReason = ESP_RST_UNKNOWN;
@@ -178,7 +178,17 @@ static const char* resetName(esp_reset_reason_t r) {
 // of output with a slow reader looks exactly like "buttons stopped
 // responding". setup() lowers the timeout to 5 ms; this records what the worst
 // single call actually cost.
+//
+// The timeout alone is not enough. HWCDC::write's wait is 20 x tx_timeout_ms
+// *per call*, and this build measured exactly that (100 ms) as soon as MIDI
+// started arriving with nothing draining the port -- so the fix is to not
+// write at all when the ring has no room for the line, and count it instead.
 static void monPrint(const char* prefix, const char* body) {
+  size_t need = strlen(prefix) + (body ? strlen(body) : 0) + 2;
+  if ((size_t)Serial.availableForWrite() < need) {
+    printSkipped++;
+    return;
+  }
   unsigned long t0 = micros();
   Serial.print(prefix);
   if (body) Serial.println(body);
@@ -202,11 +212,12 @@ void setup() {
   // of loop time, which is a frozen UI with a perfectly healthy firmware.
   Serial.setTxTimeoutMs(5);
   delay(300);
-  Serial.println();
-  Serial.println("[MIDI-MONITOR] ESP32_Host_MIDI + OLED + buttons");
+  monPrint("[MIDI-MONITOR] ESP32_Host_MIDI + OLED + buttons", nullptr);
   bootReason = esp_reset_reason();
-  Serial.printf("[MIDI-MONITOR] reset=%s (0x%x)\n", resetName(bootReason),
-                (unsigned)bootReason);
+  char rst[48];
+  snprintf(rst, sizeof(rst), "reset=%s (0x%x)", resetName(bootReason),
+           (unsigned)bootReason);
+  monPrint("[MIDI-MONITOR] ", rst);
 
   const uint8_t pins[] = { PIN_SHIFT, PIN_NAV1, PIN_NAV2,
                            PIN_DIR_UP, PIN_DIR_DOWN, PIN_DIR_LEFT };
@@ -223,8 +234,8 @@ void setup() {
   // nothing about whether the device answered.
   Wire.beginTransmission(0x3C);
   oledOk = (Wire.endTransmission() == 0);
-  Serial.print("[MIDI-MONITOR] OLED at 0x3C: ");
-  Serial.println(oledOk ? "responding" : "no ACK");
+  monPrint("[MIDI-MONITOR] OLED at 0x3C: ",
+           oledOk ? "responding" : "no ACK");
 
   // Transport 1: DIN-5 wire MIDI.
   dinMIDI.begin(Serial1, MIDI_RX_PIN, MIDI_TX_PIN);
@@ -302,7 +313,7 @@ static void drainQueue() {
       lastMidiPrintMs = millis();
       monPrint("[MIDI] ", line);
     } else {
-      midiSkipped++;
+      printSkipped++;
     }
 
     // ---- BLE -> DIN-5 bridge ------------------------------------------------
@@ -442,7 +453,7 @@ static void render() {
       row(26, "loop %lu", (unsigned long)loopCount);
       row(38, "gapmax %lums", (unsigned long)(loopGapMaxUs / 1000));
       row(50, "print %lums x%lu", (unsigned long)(printWorstUs / 1000),
-          (unsigned long)midiSkipped);
+          (unsigned long)printSkipped);
       row(62, "boot %s", resetName(bootReason));
       break;
   }
@@ -567,7 +578,7 @@ void loop() {
              fwdEnabled ? "on" : "off",
              (unsigned)(logCount < LOG_N ? logCount : LOG_N), LOG_N,
              (unsigned long)loopCount, (unsigned long)(loopGapMaxUs / 1000),
-             (unsigned long)(printWorstUs / 1000), (unsigned long)midiSkipped,
+             (unsigned long)(printWorstUs / 1000), (unsigned long)printSkipped,
              resetName(bootReason));
     monPrint(al, nullptr);
   }
