@@ -45,6 +45,7 @@ BLE path, from a `ProbeE` run, 245 s uptime:
 | MIDI TX path works | `sendNoteOn/Off` → UART 31250 → IO15, self-test note on C4 |
 | MIDI RX path (BLE) | **verified by `MidiMonitor`**: 1298 events from an iPhone in one 695 s run, `rx=1298 tx=1298 fail=0` |
 | MIDI RX path (DIN-5) | **verified end to end**, both directions — see below |
+| MIDI TX path (`send*` → DIN-5 OUT) | **verified by round trip**, not by the library's return value: `m` puts `sendNoteOn`/`sendNoteOff` through `&dinMIDI` and all 13 pairs came back as `D` events |
 
 ### The DIN-5 IN fault that was not software
 
@@ -254,9 +255,19 @@ the host. Open COM8 at 115200, send single characters, no line protocol:
 | `a` | toggle the hand-free sweep: `HIGH → LOW → hiZ`, 3 s each, reporting the IN pad at every step |
 | `t` | toggle the DIN-5 self-test (every 5 s) |
 | `b` | toggle the six-byte loopback burst, which implies `t` |
+| `m` | toggle the **forward-path** loopback: `sendNoteOn`/`sendNoteOff` through the library to `&dinMIDI`, C4 velocity 111, every 3 s |
 | `?` | list them |
 
 `tools\serial.ps1 -Send 'a' -Seconds 50` does this from PowerShell.
+
+**Why `m` exists and why it is not the same as `b`.** The six-byte burst writes
+to `Serial1` directly, so it proves the wire but says nothing about the path the
+BLE bridge uses. `m` makes exactly the call the bridge makes, and the bridge's
+`send*()` returning true only means the library accepted the event — not that a
+byte left the board. With the loopback cable in place, `m`'s notes come back as
+`D` events, which closes that gap: 13 note-on/note-off pairs in 40 s, `fail=0`,
+all of them parsed. DIN-5 OUT is therefore verified as an *output* driving a real
+optocoupler load, not merely as a pad that toggles.
 
 **Both diagnostics are off by default**, and that is a behaviour change rather
 than a default value: the self-test ends the UART every 5 s for ~15 ms, which
