@@ -121,6 +121,17 @@ static esp_reset_reason_t bootReason = ESP_RST_UNKNOWN;
 // device plugged in = nothing is arriving at IO4 at all.
 static uint16_t dinRxFifoPeak = 0;
 
+// Where the DIN-5 chain actually breaks, split at the wire.
+//
+// IO15 is the UART TX pad, IO4 the pad behind the MIDI IN optocoupler; a UART
+// idles high, so every LOW sample is a bit on that wire. txlo moving while
+// rxlo stays flat puts the fault in the cable or the optocoupler, not firmware
+// -- and both counters self-validate at idle: IO15 must read high with nothing
+// transmitting, so a txlo that grows at rest means the input buffer is not
+// readable on that pad and the number should be ignored.
+static uint32_t dinTxLowSamples = 0;
+static uint32_t dinRxLowSamples = 0;
+
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
   uint8_t pin;
@@ -509,6 +520,9 @@ void loop() {
   int pending = Serial1.available();
   if (pending > (int)dinRxFifoPeak) dinRxFifoPeak = (uint16_t)pending;
 
+  if (digitalRead(MIDI_TX_PIN) == LOW) dinTxLowSamples++;
+  if (digitalRead(MIDI_RX_PIN) == LOW) dinRxLowSamples++;
+
   midiHandler.task();
   drainQueue();
 
@@ -597,11 +611,24 @@ void loop() {
     // covers the whole thing. gap/print/skip are the diagnostic fields: gap is
     // the worst loop stall ever seen, print the worst single serial call, skip
     // how many event lines were dropped by the rate limiter.
+    // lo15/lo4 are the physical-layer probe: LOW samples seen on the UART TX
+    // pad and on the pad behind the MIDI IN optocoupler during this 5 s
+    // window. A loopback that moves lo15 while lo4 stays flat puts the fault
+    // in the cable or the optocoupler; if lo15 never moves the UART is not
+    // shifting bits out. Both must sit at 0 at rest -- IO15 idles high, so a
+    // counter that grows with nothing transmitting means the input buffer is
+    // not readable on that pad and the number proves nothing.
+    static uint32_t lastLo15 = 0, lastLo4 = 0;
+    uint32_t dLo15 = dinTxLowSamples - lastLo15;
+    uint32_t dLo4 = dinRxLowSamples - lastLo4;
+    lastLo15 = dinTxLowSamples;
+    lastLo4 = dinRxLowSamples;
+
     char al[200];
     snprintf(al, sizeof(al),
              "[ALIVE] up=%lus heap=%u rx=%lu tx=%lu fail=%u queue=%u "
              "ble=%s fwd=%s log=%u/%u loop=%lu gap=%lums print=%lums skip=%lu "
-             "fifo=%u boot=%s",
+             "fifo=%u lo15=%lu lo4=%lu boot=%s",
              millis() / 1000, (unsigned)ESP.getFreeHeap(),
              (unsigned long)rxEvents, (unsigned long)txEvents,
              (unsigned)fwdFailures,
@@ -611,7 +638,8 @@ void loop() {
              (unsigned)(logCount < LOG_N ? logCount : LOG_N), LOG_N,
              (unsigned long)loopCount, (unsigned long)(loopGapMaxUs / 1000),
              (unsigned long)(printWorstUs / 1000), (unsigned long)printSkipped,
-             (unsigned)dinRxFifoPeak, resetName(bootReason));
+             (unsigned)dinRxFifoPeak, (unsigned long)dLo15, (unsigned long)dLo4,
+             resetName(bootReason));
     monPrint(al, nullptr);
   }
 }
