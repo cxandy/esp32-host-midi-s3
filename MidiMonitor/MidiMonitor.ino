@@ -112,6 +112,44 @@ static unsigned long lastLoopUs = 0;
 static unsigned long lastMidiPrintMs = 0;
 static esp_reset_reason_t bootReason = ESP_RST_UNKNOWN;
 
+// ---- Buttons ---------------------------------------------------------------
+struct Button {
+  uint8_t pin;
+  const char* name;
+  bool held = false;
+  bool longFired = false;
+  unsigned long downAt = 0;
+};
+
+static Button btnShift = { PIN_SHIFT,    "SHIFT" };
+static Button btnNav1  = { PIN_NAV1,     "NAV1" };
+static Button btnNav2  = { PIN_NAV2,     "NAV2" };
+static Button btnUp    = { PIN_DIR_UP,   "UP" };
+static Button btnDown  = { PIN_DIR_DOWN, "DOWN" };
+static Button btnLeft  = { PIN_DIR_LEFT, "LEFT" };
+
+// Returns true on press and again on the long-press threshold, which is what
+// makes "hold to restart" work without blocking in delay().
+static bool pollButton(Button& b) {
+  bool now = (digitalRead(b.pin) == LOW);
+  bool fired = false;
+  if (now && !b.held) {
+    b.held = true; b.downAt = millis(); b.longFired = false; fired = true;
+  } else if (now && b.held && !b.longFired &&
+             millis() - b.downAt >= LONG_PRESS_MS) {
+    b.longFired = true; fired = true;
+  } else if (!now && b.held) {
+    b.held = false;
+  }
+  return fired;
+}
+
+// ---- Print path -------------------------------------------------------------
+// These two live after pollButton on purpose: the Arduino preprocessor puts
+// its generated prototypes before the first function in the file, and that
+// point has to stay below struct Button or pollButton's prototype is emitted
+// with no known argument types and the build fails.
+
 static const char* resetName(esp_reset_reason_t r) {
   switch (r) {
     case ESP_RST_POWERON:   return "poweron";
@@ -147,38 +185,6 @@ static void monPrint(const char* prefix, const char* body) {
   else      Serial.println();
   unsigned long took = micros() - t0;
   if (took > printWorstUs) printWorstUs = took;
-}
-
-// ---- Buttons ---------------------------------------------------------------
-struct Button {
-  uint8_t pin;
-  const char* name;
-  bool held = false;
-  bool longFired = false;
-  unsigned long downAt = 0;
-};
-
-static Button btnShift = { PIN_SHIFT,    "SHIFT" };
-static Button btnNav1  = { PIN_NAV1,     "NAV1" };
-static Button btnNav2  = { PIN_NAV2,     "NAV2" };
-static Button btnUp    = { PIN_DIR_UP,   "UP" };
-static Button btnDown  = { PIN_DIR_DOWN, "DOWN" };
-static Button btnLeft  = { PIN_DIR_LEFT, "LEFT" };
-
-// Returns true on press and again on the long-press threshold, which is what
-// makes "hold to restart" work without blocking in delay().
-static bool pollButton(Button& b) {
-  bool now = (digitalRead(b.pin) == LOW);
-  bool fired = false;
-  if (now && !b.held) {
-    b.held = true; b.downAt = millis(); b.longFired = false; fired = true;
-  } else if (now && b.held && !b.longFired &&
-             millis() - b.downAt >= LONG_PRESS_MS) {
-    b.longFired = true; fired = true;
-  } else if (!now && b.held) {
-    b.held = false;
-  }
-  return fired;
 }
 
 static void logAdd(const char* text) {
