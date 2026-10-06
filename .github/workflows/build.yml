@@ -89,6 +89,14 @@ jobs:
           # directly, since U8G2 swallows NACKs.
           - sketch: ProbeH
             fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
+          # The application rather than a probe: DIN-5 + BLE driving a real
+          # OLED monitor with the board's buttons. Built on what the probes
+          # proved rather than re-testing any of it -- in particular ProbeH's
+          # finding that a full-buffer redraw costs 31 ms of I2C no matter the
+          # bus speed, which is why this one only redraws when the picture has
+          # actually changed.
+          - sketch: MidiMonitor
+            fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=default_8MB,USBMode=hwcdc,CDCOnBoot=cdc,LoopCore=1,EventsCore=1
 
     steps:
       - uses: actions/checkout@v4
