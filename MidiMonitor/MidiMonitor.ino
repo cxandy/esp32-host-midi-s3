@@ -124,13 +124,27 @@ static uint16_t dinRxFifoPeak = 0;
 // Where the DIN-5 chain actually breaks, split at the wire.
 //
 // IO15 is the UART TX pad, IO4 the pad behind the MIDI IN optocoupler; a UART
-// idles high, so every LOW sample is a bit on that wire. txlo moving while
-// rxlo stays flat puts the fault in the cable or the optocoupler, not firmware
-// -- and both counters self-validate at idle: IO15 must read high with nothing
-// transmitting, so a txlo that grows at rest means the input buffer is not
-// readable on that pad and the number should be ignored.
+// idles high, so a pad that reads LOW at rest is not carrying a usable idle
+// state. Four counters, because the first pair alone lied: lo15/lo4 both came
+// back equal to the loop count -- literally LOW on every sample -- which is
+// indistinguishable from a real stuck-low line and from a pad whose input
+// buffer is off. So each reading now carries its own referee:
+//
+//   lo2    -- IO2 is a button with INPUT_PULLUP, so it *must* idle high. If it
+//             also counts every loop, digitalRead is the broken part and the
+//             other two numbers say nothing.
+//   rxav   -- loops in which the UART RX FIFO actually held a byte. A line
+//             stuck low is a permanent break: the UART emits 0x00 at 3125 B/s,
+//             so rxav climbs ~15k per 5 s window even though the parser
+//             discards every one of them (data byte, no running status).
+//   txf    -- loops in which the UART TX FIFO was non-empty, i.e. the library's
+//             write really reached the peripheral rather than only returning
+//             true.
 static uint32_t dinTxLowSamples = 0;
 static uint32_t dinRxLowSamples = 0;
+static uint32_t nav1LowSamples = 0;
+static uint32_t rxAvailHits = 0;
+static uint32_t txFifoBusyHits = 0;
 
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
@@ -522,6 +536,12 @@ void loop() {
 
   if (digitalRead(MIDI_TX_PIN) == LOW) dinTxLowSamples++;
   if (digitalRead(MIDI_RX_PIN) == LOW) dinRxLowSamples++;
+  if (digitalRead(PIN_NAV1) == LOW) nav1LowSamples++;
+  if (pending > 0) rxAvailHits++;
+  // 128 is the hardware FIFO depth: anything less means bytes are sitting in
+  // the transmitter right now. It also reads 0 before the UART is begun, so
+  // txf pinned at the loop count is itself a finding, not a measurement.
+  if (Serial1.availableForWrite() < 128) txFifoBusyHits++;
 
   midiHandler.task();
   drainQueue();
@@ -613,22 +633,31 @@ void loop() {
     // how many event lines were dropped by the rate limiter.
     // lo15/lo4 are the physical-layer probe: LOW samples seen on the UART TX
     // pad and on the pad behind the MIDI IN optocoupler during this 5 s
-    // window. A loopback that moves lo15 while lo4 stays flat puts the fault
-    // in the cable or the optocoupler; if lo15 never moves the UART is not
-    // shifting bits out. Both must sit at 0 at rest -- IO15 idles high, so a
-    // counter that grows with nothing transmitting means the input buffer is
-    // not readable on that pad and the number proves nothing.
-    static uint32_t lastLo15 = 0, lastLo4 = 0;
-    uint32_t dLo15 = dinTxLowSamples - lastLo15;
-    uint32_t dLo4 = dinRxLowSamples - lastLo4;
+    // window, with lo2 as the referee (IO2 has a pull-up, so it must stay 0)
+    // and rxav/txf as the UART-side truth. The line is separate from [ALIVE]
+    // only for length; it prints on the same beat.
+    static uint32_t lastLo15 = 0, lastLo4 = 0, lastLo2 = 0;
+    static uint32_t lastRxAv = 0, lastTxF = 0;
+    char din[200];
+    snprintf(din, sizeof(din),
+             "[DIN] lo15=%lu lo4=%lu lo2=%lu rxav=%lu txf=%lu",
+             (unsigned long)(dinTxLowSamples - lastLo15),
+             (unsigned long)(dinRxLowSamples - lastLo4),
+             (unsigned long)(nav1LowSamples - lastLo2),
+             (unsigned long)(rxAvailHits - lastRxAv),
+             (unsigned long)(txFifoBusyHits - lastTxF));
     lastLo15 = dinTxLowSamples;
     lastLo4 = dinRxLowSamples;
+    lastLo2 = nav1LowSamples;
+    lastRxAv = rxAvailHits;
+    lastTxF = txFifoBusyHits;
+    monPrint(din, nullptr);
 
     char al[200];
     snprintf(al, sizeof(al),
              "[ALIVE] up=%lus heap=%u rx=%lu tx=%lu fail=%u queue=%u "
              "ble=%s fwd=%s log=%u/%u loop=%lu gap=%lums print=%lums skip=%lu "
-             "fifo=%u lo15=%lu lo4=%lu boot=%s",
+             "fifo=%u boot=%s",
              millis() / 1000, (unsigned)ESP.getFreeHeap(),
              (unsigned long)rxEvents, (unsigned long)txEvents,
              (unsigned)fwdFailures,
@@ -638,8 +667,7 @@ void loop() {
              (unsigned)(logCount < LOG_N ? logCount : LOG_N), LOG_N,
              (unsigned long)loopCount, (unsigned long)(loopGapMaxUs / 1000),
              (unsigned long)(printWorstUs / 1000), (unsigned long)printSkipped,
-             (unsigned)dinRxFifoPeak, (unsigned long)dLo15, (unsigned long)dLo4,
-             resetName(bootReason));
+             (unsigned)dinRxFifoPeak, resetName(bootReason));
     monPrint(al, nullptr);
   }
 }
