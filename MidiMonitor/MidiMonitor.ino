@@ -184,17 +184,27 @@ static const char* resetName(esp_reset_reason_t r) {
 // started arriving with nothing draining the port -- so the fix is to not
 // write at all when the ring has no room for the line, and count it instead.
 static void monPrint(const char* prefix, const char* body) {
-  size_t need = strlen(prefix) + (body ? strlen(body) : 0) + 2;
+  // One buffer, one write. prefix and body used to be two separate write()
+  // calls, and the host can stop draining between them: the prefix lands, the
+  // body is short-written away, and the capture shows "[MIDI] " followed by
+  // the next line glued to it -- which reads exactly like memory corruption
+  // and nearly cost this investigation a wrong turn.
+  char buf[240];
+  int n = snprintf(buf, sizeof(buf), "%s%s\n", prefix, body ? body : "");
+  if (n <= 0 || (size_t)n >= sizeof(buf)) {
+    printSkipped++;
+    return;
+  }
+  size_t need = (size_t)n;
   if ((size_t)Serial.availableForWrite() < need) {
     printSkipped++;
     return;
   }
   unsigned long t0 = micros();
-  Serial.print(prefix);
-  if (body) Serial.println(body);
-  else      Serial.println();
+  size_t wrote = Serial.write((const uint8_t*)buf, need);
   unsigned long took = micros() - t0;
   if (took > printWorstUs) printWorstUs = took;
+  if (wrote < need) printSkipped++;  // backpressure ate the tail; counted, not hidden
 }
 
 static void logAdd(const char* text) {
