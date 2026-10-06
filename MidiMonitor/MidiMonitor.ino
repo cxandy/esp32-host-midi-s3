@@ -146,6 +146,12 @@ static uint32_t nav1LowSamples = 0;
 static uint32_t rxAvailHits = 0;
 static uint32_t txFifoBusyHits = 0;
 static uint32_t dinSelfTests = 0;
+// Result of the last electrical self-test, as percent of samples that read
+// LOW: io4 while IO15 is driven high / low, and IO15 read back while driven
+// high. They are only refreshed by a test run, so 0/0/0 before `st` moves.
+static uint8_t testPctIo4AtHigh = 0;
+static uint8_t testPctIo4AtLow = 0;
+static uint8_t testPctIo15Read = 0;
 
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
@@ -547,18 +553,24 @@ void loop() {
   midiHandler.task();
   drainQueue();
 
-  // ---- DIN-5 self-test: the firmware drives its own loopback ---------------
-  // Nothing here needs a phone or a second device. Every 5 s, once nothing has
-  // arrived for 400 ms (so the burst cannot interleave with a forwarded note
-  // and corrupt it), the sketch writes a NoteOn/NoteOff pair straight to
-  // Serial1 -- bypassing the library's send path on purpose, so `txf` proves
-  // the bytes reached the UART hardware regardless of what the send function
-  // reported. A working loopback brings the same six bytes back in: they show
-  // up as `D` lines, rx climbs while tx does not (the test never enters tx),
-  // and rxav/fifo move with them.
+  // ---- DIN-5 self-test: the firmware tests its own loopback ---------------
+  // Nothing here needs a phone, a synth or a second device, and it runs in two
+  // layers because the serial one alone cannot separate "no signal on the
+  // wire" from "UART not wired to that pad":
   //
-  // drainQueue() only forwards events whose source is not dinMIDI, so what
-  // comes back is displayed, not echoed.
+  //   1. Electrical. Serial1.end() releases IO15, the sketch drives it high
+  //      for 1.5 ms and low for 1.5 ms while sampling IO4. This bypasses UART,
+  //      parser and cable protocol entirely -- if the loopback (driver -> jack
+  //      -> cable -> opto -> IO4) works, io4 must follow. io15read is the same
+  //      read-back on IO15, so a pad whose input buffer cannot be read is
+  //      visible rather than silently poisoning the number.
+  //   2. Serial. The UART is re-opened on 4/15 and six bytes go out. A working
+  //      path brings them back as `D` lines with rx climbing while tx stands
+  //      still (the test never enters tx), and rxav/fifo moving with them.
+  //
+  // The 400 ms quiet gate keeps the burst from interleaving with a forwarded
+  // note, and drainQueue() only forwards events whose source is not dinMIDI,
+  // so what comes back is displayed, not echoed.
   {
     static uint32_t lastRxCount = 0;
     static unsigned long quietSinceMs = 0;
@@ -571,6 +583,36 @@ void loop() {
     }
     if (millis() - quietSinceMs > 400 && millis() - lastSelfTestMs >= 5000) {
       lastSelfTestMs = millis();
+
+      // --- layer 1: electrical ------------------------------------------------
+      Serial1.end();
+      pinMode(MIDI_TX_PIN, OUTPUT);
+
+      digitalWrite(MIDI_TX_PIN, HIGH);
+      uint32_t lo4High = 0, lo15High = 0, nHigh = 0;
+      uint32_t t0 = micros();
+      while (micros() - t0 < 1500) {
+        nHigh++;
+        if (digitalRead(MIDI_RX_PIN) == LOW) lo4High++;
+        if (digitalRead(MIDI_TX_PIN) == LOW) lo15High++;
+      }
+
+      digitalWrite(MIDI_TX_PIN, LOW);
+      uint32_t lo4Low = 0, nLow = 0;
+      t0 = micros();
+      while (micros() - t0 < 1500) {
+        nLow++;
+        if (digitalRead(MIDI_RX_PIN) == LOW) lo4Low++;
+      }
+
+      testPctIo4AtHigh = (uint8_t)(lo4High * 100 / (nHigh ? nHigh : 1));
+      testPctIo4AtLow  = (uint8_t)(lo4Low * 100 / (nLow ? nLow : 1));
+      testPctIo15Read  = (uint8_t)(lo15High * 100 / (nHigh ? nHigh : 1));
+
+      // --- layer 2: serial ----------------------------------------------------
+      // Re-open rather than begin(): end() released the pad routing, and the
+      // library's own begin() would return early on its _initialized guard.
+      Serial1.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
       static const uint8_t msg[6] = { 0x90, 60, 100, 0x80, 60, 0 };
       Serial1.write(msg, sizeof(msg));
       dinSelfTests++;
@@ -684,6 +726,13 @@ void loop() {
     lastRxAv = rxAvailHits;
     lastTxF = txFifoBusyHits;
     monPrint(din, nullptr);
+
+    char tst[200];
+    snprintf(tst, sizeof(tst),
+             "[TEST] st=%lu io4lo@15H=%u%% io4lo@15L=%u%% io15read@15H=%u%%",
+             (unsigned long)dinSelfTests, (unsigned)testPctIo4AtHigh,
+             (unsigned)testPctIo4AtLow, (unsigned)testPctIo15Read);
+    monPrint(tst, nullptr);
 
     char al[200];
     snprintf(al, sizeof(al),
