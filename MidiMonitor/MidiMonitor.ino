@@ -22,8 +22,9 @@
 // Layout: 4 pages, NAV1/NAV2 to move between them, UP/DOWN to scroll the log,
 // LEFT toggles BLE -> DIN-5 forwarding. The last page is DIAG: loop counter,
 // worst loop gap, worst single serial print, boot reset reason -- evidence that
-// is visible on the panel even when nobody is reading the COM port. Long-press
-// DOWN restarts; long-press SHIFT forces download mode (IO0 low).
+// is visible on the panel even when nobody is reading the COM port. Every log
+// line carries its source: B for BLE, D for DIN-5. Long-press DOWN restarts;
+// long-press SHIFT forces download mode (IO0 low).
 
 #include <Arduino.h>
 #include <ESP32_Host_MIDI.h>
@@ -314,14 +315,20 @@ static void drainQueue() {
         break;
       }
     }
-    logAdd(line);
+    // Source marker. Nothing else on screen distinguishes a note that arrived
+    // over DIN-5 from one the phone sent, and knowing which input moved is the
+    // whole point of a monitor. B = BLE peripheral, D = DIN-5 wire.
+    char tagged[40];
+    snprintf(tagged, sizeof(tagged), "%c %s",
+             ev.source == &dinMIDI ? 'D' : 'B', line);
+    logAdd(tagged);
     // Serial output is a measured cost here, not a free one: 25 lines a second
     // is more than anyone can read, and every line beyond that is time taken
     // away from the loop (see monPrint). The ones not written are counted as
     // `skip` on the DIAG page instead of silently happening.
     if (millis() - lastMidiPrintMs >= 40) {
       lastMidiPrintMs = millis();
-      monPrint("[MIDI] ", line);
+      monPrint("[MIDI] ", tagged);
     } else {
       printSkipped++;
     }
@@ -450,7 +457,7 @@ static void render() {
       row(11, "KEYS");
       u8g2.drawHLine(0, 14, 128);
       row(26, "NAV1/2 page  L=fwd");
-      row(38, "UP/DOWN scroll log");
+      row(38, "UP/DN scroll B/D=src");
       row(50, "hold DOWN  restart");
       row(62, "hold SHIFT download");
       break;
