@@ -1,7 +1,8 @@
 // ESP32_Host_MIDI / MidiMonitor -- the application, not a probe.
 //
-// Scope, as settled: ESP32_Host_MIDI + OLED + buttons on this board. The
-// AciduinoV2Box firmware is not part of it; it only supplied the pin map.
+// Scope, as settled: ESP32_Host_MIDI + OLED + buttons on this board, with a
+// BLE -> DIN-5 bridge underneath the monitor. The AciduinoV2Box firmware is
+// not part of it; it only supplied the pin map.
 //
 // What the probes already established, so this does not re-test it:
 //   - both transports run together (ProbeF: DIN-5 out, BLE in with rx=118 real
@@ -18,8 +19,9 @@
 // the difference between this and ProbeF, which redrew every 200 ms unconditionally
 // and so paid 31 ms five times a second whether or not the picture had moved.
 //
-// Layout: 3 pages, NAV1/NAV2 to move between them, UP/DOWN to scroll the log.
-// Long-press DOWN restarts; long-press SHIFT forces download mode (IO0 low).
+// Layout: 3 pages, NAV1/NAV2 to move between them, UP/DOWN to scroll the log,
+// LEFT toggles BLE -> DIN-5 forwarding. Long-press DOWN restarts; long-press
+// SHIFT forces download mode (IO0 low).
 
 #include <Arduino.h>
 #include <ESP32_Host_MIDI.h>
@@ -36,6 +38,7 @@
 #define PIN_SHIFT      0
 #define PIN_NAV2       1
 #define PIN_NAV1       2
+#define PIN_DIR_LEFT   42
 #define PIN_DIR_UP     40
 #define PIN_DIR_DOWN   41
 #define PIN_LED        48
@@ -45,8 +48,14 @@
 
 #define LONG_PRESS_MS  1500
 
-// 150 ms: a shade under the 31 ms render cost times nothing -- it exists so a
-// run of NoteOns cannot queue up redraws faster than the bus can drain them.
+// BLE -> DIN-5 forwarding: the point of the box is a phone driving whatever is
+// plugged into the 5-pin out. DIR LEFT toggles it at runtime, since a bridge
+// that can only be turned on by reflashing is not much of a bridge.
+static bool fwdEnabled = true;
+
+// 150 ms floor between redraws. A render costs 31 ms of I2C (ProbeH), so this
+// caps the screen at ~6.6 redraws/second even during a chord, and leaves the
+// loop free for MIDI in between.
 #define MIN_RENDER_MS  150
 
 static const char* BLE_NAME = "ESP32-S3 MIDI";
@@ -75,6 +84,7 @@ static uint16_t scroll = 0;    // 0 = showing the newest entry
 static uint64_t lastEventIndex = 0;
 static uint32_t rxEvents = 0;
 static uint32_t txEvents = 0;
+static uint32_t fwdFailures = 0;
 
 static bool bleEverConnected = false;
 static unsigned long bleConnectedAtMs = 0;
@@ -100,6 +110,7 @@ static Button btnNav1  = { PIN_NAV1,     "NAV1" };
 static Button btnNav2  = { PIN_NAV2,     "NAV2" };
 static Button btnUp    = { PIN_DIR_UP,   "UP" };
 static Button btnDown  = { PIN_DIR_DOWN, "DOWN" };
+static Button btnLeft  = { PIN_DIR_LEFT, "LEFT" };
 
 // Returns true on press and again on the long-press threshold, which is what
 // makes "hold to restart" work without blocking in delay().
@@ -133,7 +144,7 @@ void setup() {
   Serial.println("[MIDI-MONITOR] ESP32_Host_MIDI + OLED + buttons");
 
   const uint8_t pins[] = { PIN_SHIFT, PIN_NAV1, PIN_NAV2,
-                           PIN_DIR_UP, PIN_DIR_DOWN };
+                           PIN_DIR_UP, PIN_DIR_DOWN, PIN_DIR_LEFT };
   for (uint8_t p : pins) pinMode(p, INPUT_PULLUP);
 
   u8g2.begin();
@@ -161,7 +172,11 @@ void setup() {
   midiHandler.addTransport(&bleServer);
 
   MIDIHandlerConfig cfg;
-  cfg.maxEvents = 20;
+  // 64 rather than the default 20: while forwarding, an event sitting in the
+  // queue is a note that has not reached the synth yet, so queue depth is
+  // literally output latency. A 16th-note run at 120 bpm is ~8 notes a second;
+  // 64 gives headroom for a chord-heavy burst without dropping the oldest.
+  cfg.maxEvents = 64;
   cfg.bleName = BLE_NAME;
   midiHandler.begin(cfg);
 
@@ -216,6 +231,63 @@ static void drainQueue() {
     logAdd(line);
     Serial.print("[MIDI] ");
     Serial.println(line);
+
+    // ---- BLE -> DIN-5 bridge ------------------------------------------------
+    // Every transport the handler is holding except the one this came in on.
+    // In practice that means "BLE in -> DIN out", which is the direction that
+    // matters: the phone is the sequencer, the DIN-5 jack drives the synth.
+    //
+    // Two things this depends on, both verified in the library source:
+    //   - channel numbering. The queue stores channel0 as 0..15 (MIDI spec
+    //     convention); send* takes 1..16 and rejects 0 outright
+    //     (MIDIHandler.cpp:688). Passing channel0 through unchanged would make
+    //     every MIDI channel 1 note return false and never leave the board --
+    //     silently, since it just looks like a send that did not happen.
+    //   - target is passed explicitly rather than left to default. With no
+    //     target sendNoteOn walks every transport and stops at the first that
+    //     accepts (MIDIHandler.cpp:692) -- DIN today only because dinMIDI was
+    //     registered first. Explicit means reordering addTransport() later
+    //     cannot turn this into a loop that echoes the phone's notes back.
+    //
+    // The library also normalizes NoteOn@vel0 to MIDI_NOTE_OFF on the way in
+    // (MIDIHandler.cpp:664), so statusCode forwards as-is and the synth never
+    // sees an ambiguous release.
+    if (fwdEnabled && ev.source != &dinMIDI) {
+      const uint8_t ch = ev.channel0 + 1;   // queue 0..15 -> send* 1..16
+      bool ok = false;
+      bool supported = true;
+      switch (ev.statusCode) {
+        case MIDI_NOTE_ON:
+          ok = midiHandler.sendNoteOn(ch, ev.noteNumber, ev.velocity7, &dinMIDI);
+          break;
+        case MIDI_NOTE_OFF:
+          ok = midiHandler.sendNoteOff(ch, ev.noteNumber, ev.velocity7, &dinMIDI);
+          break;
+        case MIDI_CONTROL_CHANGE:
+          ok = midiHandler.sendControlChange(ch, ev.noteNumber, ev.velocity7,
+                                             &dinMIDI);
+          break;
+        case MIDI_PROGRAM_CHANGE:
+          ok = midiHandler.sendProgramChange(ch, ev.noteNumber, &dinMIDI);
+          break;
+        case MIDI_PITCH_BEND:
+          // Queue carries the MIDI 1.0 14-bit form, 0..16383 with centre at
+          // 8192; sendPitchBend wants -8192..8191.
+          ok = midiHandler.sendPitchBend(ch, (int)ev.pitchBend14 - 8192,
+                                         &dinMIDI);
+          break;
+        default:
+          // Channel/poly pressure have no send helper in the library, and
+          // SysEx never reaches this function -- it lives in its own queue
+          // (MIDISysExEvent) with its own callback. Both are left alone rather
+          // than hand-rolled: nothing here needs aftertouch or SysEx, and a
+          // half-forwarded message is worse than none.
+          supported = false;
+          break;
+      }
+      if (ok) txEvents++;
+      else if (supported) fwdFailures++;
+    }
   }
 }
 
@@ -244,8 +316,11 @@ static void render() {
     case 0: {
       // The monitor itself: four most recent events, newest at the bottom,
       // the way a console reads. Header carries the running total so a screen
-      // full of nothing is distinguishable from one that stopped updating.
-      row(11, "MONITOR   rx=%lu", (unsigned long)rxEvents);
+      // full of nothing is distinguishable from one that stopped updating,
+      // plus the forwarding state -- because a bridge that silently mutes is
+      // worse than one that was never wired up.
+      row(11, "rx=%lu tx=%lu %s", (unsigned long)rxEvents,
+          (unsigned long)txEvents, fwdEnabled ? "FWD" : "MUTE");
       u8g2.drawHLine(0, 14, 128);
       if (logCount == 0) {
         row(30, "no MIDI yet");
@@ -258,7 +333,8 @@ static void render() {
           if (back >= logCount) break;
           row((uint8_t)(26 + i * 12), "%s", logText[logIndex(back)]);
         }
-        if (scroll) row(11, "MONITOR   rx=%lu ^", (unsigned long)rxEvents);
+        if (scroll) row(11, "rx=%lu tx=%lu %s ^", (unsigned long)rxEvents,
+                        (unsigned long)txEvents, fwdEnabled ? "FWD" : "MUTE");
       }
       break;
     }
@@ -266,9 +342,12 @@ static void render() {
       bool conn = bleServer.isConnected();
       row(11, "STATUS");
       u8g2.drawHLine(0, 14, 128);
-      row(26, "ble    %s", conn ? "connected" : "advertising");
-      row(38, "din5   rx4 tx15");
-      row(50, "queue  %u", (unsigned)midiHandler.getQueue().size());
+      if (conn) row(26, "ble    conn %lus", bleConnectedForS);
+      else      row(26, "ble    advertising");
+      row(38, "din5   tx=%lu%s", (unsigned long)txEvents,
+          fwdEnabled ? "  fwd ON" : "  MUTE");
+      row(50, "queue  %u  fail %u",
+          (unsigned)midiHandler.getQueue().size(), (unsigned)fwdFailures);
       row(62, "heap   %u  up %lus", (unsigned)ESP.getFreeHeap(),
           millis() / 1000);
       break;
@@ -276,7 +355,7 @@ static void render() {
     case 2:
       row(11, "KEYS");
       u8g2.drawHLine(0, 14, 128);
-      row(26, "NAV1/2  page %u/%u", page + 1, pageCount);
+      row(26, "NAV1/2 page  L=fwd");
       row(38, "UP/DOWN scroll log");
       row(50, "hold DOWN  restart");
       row(62, "hold SHIFT download");
@@ -311,6 +390,12 @@ void loop() {
 
   if (pollButton(btnNav1)) { page = (page + 1) % pageCount; dirty = true; }
   if (pollButton(btnNav2)) { page = (page + pageCount - 1) % pageCount; dirty = true; }
+  if (pollButton(btnLeft)) {
+    fwdEnabled = !fwdEnabled;
+    logAdd(fwdEnabled ? "fwd ON  -> DIN" : "fwd OFF");
+    Serial.printf("[FWD] BLE -> DIN-5 %s\n", fwdEnabled ? "enabled" : "muted");
+    dirty = true;
+  }
   if (pollButton(btnUp)) {
     if (scroll + 4 < logCount) scroll++;
     dirty = true;
@@ -347,12 +432,14 @@ void loop() {
 
   if (millis() - lastBeat > 5000) {
     lastBeat = millis();
-    Serial.printf("[ALIVE] up=%lus heap=%u rx=%lu tx=%lu queue=%u ble=%s "
-                  "log=%u/%u\n",
+    Serial.printf("[ALIVE] up=%lus heap=%u rx=%lu tx=%lu fail=%u queue=%u "
+                  "ble=%s fwd=%s log=%u/%u\n",
                   millis() / 1000, (unsigned)ESP.getFreeHeap(),
                   (unsigned long)rxEvents, (unsigned long)txEvents,
+                  (unsigned)fwdFailures,
                   (unsigned)midiHandler.getQueue().size(),
                   bleServer.isConnected() ? "connected" : "advertising",
+                  fwdEnabled ? "on" : "off",
                   (unsigned)(logCount < LOG_N ? logCount : LOG_N), LOG_N);
   }
 }
