@@ -158,6 +158,14 @@ static uint32_t dinSelfTests = 0;
 static uint8_t testPctIo4AtHigh = 0;
 static uint8_t testPctIo4AtLow = 0;
 static uint8_t testPctIo15Read = 0;
+// The other two layers of the same electrical test: IO4 while the sketch puts
+// its own pull-up on the pad (100% = something on the board pulls it down
+// harder than 45 kOhm; 0% = it was only floating), and IO4 read back right
+// after the UART claims the pins again (a value that differs from
+// testPctIo4AtHigh means the UART's pin setup, not the circuit, sets that
+// level).
+static uint8_t testPctIo4Pullup = 0;
+static uint8_t testPctIo4AtUart = 0;
 
 // ---- Buttons ---------------------------------------------------------------
 struct Button {
@@ -591,36 +599,51 @@ void loop() {
       lastSelfTestMs = millis();
 
       // --- layer 1: electrical ------------------------------------------------
+      // Five readings, each 1.5 ms of samples, chosen so that every failure
+      // mode has its own number instead of sharing one ambiguous "it reads
+      // low":
+      //   io4hi  IO4 while IO15 is driven high (mark) -- who holds it?
+      //   io4lo  IO4 while IO15 is driven low  (space) -- does it follow?
+      //   io4pu  IO4 with a pull-up on top     -- driven low, or just floating?
+      //   io15hi IO15 read back while we drive it high -- is our own drive
+      //          visible to digitalRead at all?
+      //   io4uart IO4 immediately after the UART is re-opened -- if this
+      //          differs from io4hi, the UART's own pin setup is what changes
+      //          the pad, not the circuit.
       Serial1.end();
       gpio_reset_pin((gpio_num_t)MIDI_TX_PIN);                     // GPIO back in charge
       gpio_set_direction((gpio_num_t)MIDI_TX_PIN, GPIO_MODE_INPUT_OUTPUT);
       gpio_set_direction((gpio_num_t)MIDI_RX_PIN, GPIO_MODE_INPUT); // input buffer on
+      gpio_set_pull_mode((gpio_num_t)MIDI_RX_PIN, GPIO_FLOATING);   // no help from us
+
+      auto samplePct = [](uint8_t pin) {
+        uint32_t lows = 0, n = 0;
+        uint32_t t0 = micros();
+        while (micros() - t0 < 1500) {
+          n++;
+          if (digitalRead(pin) == LOW) lows++;
+        }
+        return (uint8_t)(lows * 100 / (n ? n : 1));
+      };
 
       digitalWrite(MIDI_TX_PIN, HIGH);
-      uint32_t lo4High = 0, lo15High = 0, nHigh = 0;
-      uint32_t t0 = micros();
-      while (micros() - t0 < 1500) {
-        nHigh++;
-        if (digitalRead(MIDI_RX_PIN) == LOW) lo4High++;
-        if (digitalRead(MIDI_TX_PIN) == LOW) lo15High++;
-      }
+      testPctIo4AtHigh = samplePct(MIDI_RX_PIN);
+      testPctIo15Read  = samplePct(MIDI_TX_PIN);
 
       digitalWrite(MIDI_TX_PIN, LOW);
-      uint32_t lo4Low = 0, nLow = 0;
-      t0 = micros();
-      while (micros() - t0 < 1500) {
-        nLow++;
-        if (digitalRead(MIDI_RX_PIN) == LOW) lo4Low++;
-      }
+      testPctIo4AtLow = samplePct(MIDI_RX_PIN);
 
-      testPctIo4AtHigh = (uint8_t)(lo4High * 100 / (nHigh ? nHigh : 1));
-      testPctIo4AtLow  = (uint8_t)(lo4Low * 100 / (nLow ? nLow : 1));
-      testPctIo15Read  = (uint8_t)(lo15High * 100 / (nHigh ? nHigh : 1));
+      digitalWrite(MIDI_TX_PIN, HIGH);
+      gpio_set_pull_mode((gpio_num_t)MIDI_RX_PIN, GPIO_PULLUP_ONLY);
+      testPctIo4Pullup = samplePct(MIDI_RX_PIN);
+      gpio_set_pull_mode((gpio_num_t)MIDI_RX_PIN, GPIO_FLOATING);
 
       // --- layer 2: serial ----------------------------------------------------
       // Re-open rather than begin(): end() released the pad routing, and the
       // library's own begin() would return early on its _initialized guard.
       Serial1.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
+      testPctIo4AtUart = samplePct(MIDI_RX_PIN);
+
       static const uint8_t msg[6] = { 0x90, 60, 100, 0x80, 60, 0 };
       Serial1.write(msg, sizeof(msg));
       dinSelfTests++;
@@ -737,9 +760,11 @@ void loop() {
 
     char tst[200];
     snprintf(tst, sizeof(tst),
-             "[TEST] st=%lu io4lo@15H=%u%% io4lo@15L=%u%% io15read@15H=%u%%",
+             "[TEST] st=%lu io4hi=%u%% io4lo=%u%% io4pu=%u%% io15hi=%u%% "
+             "io4uart=%u%%",
              (unsigned long)dinSelfTests, (unsigned)testPctIo4AtHigh,
-             (unsigned)testPctIo4AtLow, (unsigned)testPctIo15Read);
+             (unsigned)testPctIo4AtLow, (unsigned)testPctIo4Pullup,
+             (unsigned)testPctIo15Read, (unsigned)testPctIo4AtUart);
     monPrint(tst, nullptr);
 
     char al[200];
